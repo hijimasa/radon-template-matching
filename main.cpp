@@ -6,10 +6,10 @@ using namespace cv;
 using namespace std;
 
 int main() {
-    string template_image_path = "../template.jpg";
+    string template_image_path = "../figs/template.jpg";
     Mat template_image = imread(template_image_path, IMREAD_GRAYSCALE);
 
-    string target_image_path = "../target.jpg";
+    string target_image_path = "../figs/target.jpg";
     Mat target_image = imread(target_image_path, IMREAD_GRAYSCALE);
 
     if (template_image.empty() || target_image.empty()) {

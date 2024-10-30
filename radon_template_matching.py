@@ -400,14 +400,14 @@ Sample
 使用例
 """
 # Read template images / テンプレート画像を読み込む
-#image_path = 'test_image6.jpg'
-image_path = 'template.jpg'
+#image_path = 'figs/test_image6.jpg'
+image_path = 'figs/template.jpg'
 image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 #image = 255 - image
 
 # Read target images / 対象画像を読み込む
-#image_path2 = 'test_image_large.jpg'
-image_path2 = 'target.jpg'
+#image_path2 = 'figs/test_image_large.jpg'
+image_path2 = 'figs/target.jpg'
 image2 = cv2.imread(image_path2, cv2.IMREAD_GRAYSCALE)
 #image2 = 255 - image2
 
