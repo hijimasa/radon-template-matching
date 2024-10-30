@@ -1,4 +1,5 @@
 # radon-template-matching
+![matching_result](figs/result.png)
 
 ## Abstruct
 Template matching for rotation using Radon transforms.
