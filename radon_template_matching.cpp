@@ -96,6 +96,40 @@ std::vector<uint64_t> perpendicularSum(const cv::Mat &image, const std::vector<c
     return sums;
 }
 
+// 特定の角度のみでラドン変換を実行（位置推定用）
+cv::Mat radonTransformAtAngles(const cv::Mat &image, const std::vector<int> &angles) {
+    int h = image.rows, w = image.cols;
+    int line_length = static_cast<int>(sqrt(h * h + w * w));
+    int perpendicular_width = line_length;
+
+    cv::Scalar top_mean = cv::mean(image.row(0));
+    cv::Scalar bottom_mean = cv::mean(image.row(h - 1));
+    cv::Scalar left_mean = cv::mean(image.col(0));
+    cv::Scalar right_mean = cv::mean(image.col(w - 1));
+    cv::Scalar corner_pixels_mean = (top_mean + bottom_mean + left_mean + right_mean) / 4;
+
+    std::vector<std::vector<uint64_t>> angle_sums(angles.size());
+    uint64_t max_value = 0;
+
+    for (int i = 0; i < angles.size(); i++) {
+        int angle = angles[i];
+        std::vector<cv::Point> line_points = getLinePoints(image, angle, line_length);
+        std::vector<uint64_t> sums = perpendicularSum(image, line_points, perpendicular_width, static_cast<uint8_t>(corner_pixels_mean[0]));
+        angle_sums[i] = sums;
+        max_value = std::max(max_value, *max_element(sums.begin(), sums.end()));
+    }
+
+    cv::Mat normalized_image(angles.size(), line_length, CV_32S, cv::Scalar(0));
+    uint32_t* data_ptr = reinterpret_cast<uint32_t*>(normalized_image.data);
+    for (int i = 0; i < angle_sums.size(); i++) {
+        for (int j = 0; j < angle_sums[i].size(); j++) {
+            data_ptr[i * line_length + j] = static_cast<uint32_t>(angle_sums[i][j] / (float)max_value * 255);
+        }
+    }
+
+    return normalized_image;
+}
+
 // angle_step: 角度ステップ（デフォルト1度）
 cv::Mat radonTransform(const cv::Mat &image, int angle_step = 1) {
     auto radon_start = std::chrono::high_resolution_clock::now();
@@ -268,10 +302,35 @@ std::vector<float> matchTemplateOneLine(const cv::Mat &image_line, const cv::Mat
 void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
     auto total_start = std::chrono::high_resolution_clock::now();
 
-    int rows = templ.rows, cols = templ.cols;
+    // 画像縮小による高速化（角度検出用）
+    const int TARGET_SHORT_SIDE_ANGLE = 256;  // 角度検出用の縮小サイズ
+    int templ_short_side = std::min(templ.rows, templ.cols);
+    double scale_angle = (double)TARGET_SHORT_SIDE_ANGLE / templ_short_side;
+
+    std::cout << "Original template size: " << templ.cols << "x" << templ.rows << std::endl;
+    std::cout << "Original image size: " << image.cols << "x" << image.rows << std::endl;
+    std::cout << "Scale factor (for angle detection): " << scale_angle << " (target short side: " << TARGET_SHORT_SIDE_ANGLE << ")" << std::endl;
+
+    cv::Mat templ_resized_angle, image_resized_angle;
+    auto resize_start = std::chrono::high_resolution_clock::now();
+    cv::resize(templ, templ_resized_angle, cv::Size(), scale_angle, scale_angle, cv::INTER_AREA);
+    cv::resize(image, image_resized_angle, cv::Size(), scale_angle, scale_angle, cv::INTER_AREA);
+    auto resize_end = std::chrono::high_resolution_clock::now();
+
+    std::cout << "Resized template size (for angle): " << templ_resized_angle.cols << "x" << templ_resized_angle.rows << std::endl;
+    std::cout << "Resized image size (for angle): " << image_resized_angle.cols << "x" << image_resized_angle.rows << std::endl;
+    std::cout << "[0] Image resizing: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(resize_end - resize_start).count()
+              << " ms" << std::endl;
+
+    // 角度検出は縮小画像を使用
+    const cv::Mat &templ_for_angle = templ_resized_angle;
+    const cv::Mat &image_for_angle = image_resized_angle;
+
+    int rows = templ_for_angle.rows, cols = templ_for_angle.cols;
 
     auto gaussian_start = std::chrono::high_resolution_clock::now();
-    // ガウシアンウィンドウを作成
+    // ガウシアンウィンドウを作成（角度検出用）
     cv::Mat gaussian_window(rows, cols, CV_32F);
     float sigma = 0.3f;
     for (int y = 0; y < rows; y++) {
@@ -282,9 +341,9 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
         }
     }
 
-    // 画像に対応するガウシアンウィンドウを作成
-    rows = image.rows;
-    cols = image.cols;
+    // 画像に対応するガウシアンウィンドウを作成（角度検出用）
+    rows = image_for_angle.rows;
+    cols = image_for_angle.cols;
     cv::Mat gaussian_window_for_image(rows, cols, CV_32F);
     sigma = 0.5f;
     for (int y = 0; y < rows; y++) {
@@ -296,8 +355,8 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
     }
 
     cv::Mat templ_float, image_float;
-    templ.convertTo(templ_float, CV_32F);
-    image.convertTo(image_float, CV_32F);
+    templ_for_angle.convertTo(templ_float, CV_32F);
+    image_for_angle.convertTo(image_float, CV_32F);
     cv::Mat gaussian_windowed_templ = templ_float.mul(gaussian_window);
     cv::Mat gaussian_windowed_image = image_float.mul(gaussian_window_for_image);
     gaussian_windowed_templ.convertTo(gaussian_windowed_templ, CV_8UC1);
@@ -308,32 +367,25 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
               << " ms" << std::endl;
 
     // ラドン変換を適用
-    // FFT用は粗い角度ステップで高速化（5度刻み）
+    // 角度検出用: 縮小画像で粗い角度ステップ（5度刻み）
+    // 位置検出用: 元の画像で細かい角度ステップ（1度刻み）
     const int COARSE_ANGLE_STEP = 5;
     const int FINE_ANGLE_STEP = 1;
 
-    std::cout << "[2] Radon transform - template (original, fine):" << std::endl;
-    cv::Mat radon_transformed_template = radonTransform(templ, FINE_ANGLE_STEP);
-    std::cout << "[3] Radon transform - template (windowed, coarse for FFT):" << std::endl;
+    std::cout << "[2] Radon transform - template (resized for angle, coarse for FFT):" << std::endl;
     cv::Mat radon_transformed_template_for_fft = radonTransform(gaussian_windowed_templ, COARSE_ANGLE_STEP);
 
-    std::cout << "[4] Radon transform - image (original, fine):" << std::endl;
-    cv::Mat radon_transformed_image = radonTransform(image, FINE_ANGLE_STEP);
-    std::cout << "[5] Radon transform - image (windowed, coarse for FFT):" << std::endl;
+    std::cout << "[3] Radon transform - image (resized for angle, coarse for FFT):" << std::endl;
     cv::Mat radon_transformed_image_for_fft = radonTransform(gaussian_windowed_image, COARSE_ANGLE_STEP);
-
-    cv::Mat radon_transformed_template_float, radon_transformed_image_float;
-    radon_transformed_template.convertTo(radon_transformed_template_float, CV_32F);
-    radon_transformed_image.convertTo(radon_transformed_image_float, CV_32F);
 
     // FFT用: coarse角度同士で処理
     cv::Mat radon_transformed_template_for_fft2 = centerPasteImage(radon_transformed_image_for_fft, radon_transformed_template_for_fft);
 
     // FFTを適用
-    std::cout << "[6] FFT - template:" << std::endl;
+    std::cout << "[4] FFT - template:" << std::endl;
     cv::Mat fft_template = radonFFT(radon_transformed_template_for_fft2);
 
-    std::cout << "[7] FFT - image:" << std::endl;
+    std::cout << "[5] FFT - image:" << std::endl;
     cv::Mat fft_image = radonFFT(radon_transformed_image_for_fft);
     cv::Mat fft_image_combined;
     cv::vconcat(fft_image, fft_image, fft_image_combined);
@@ -350,7 +402,7 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
     auto min_iter = min_element(diff_mean_list.begin(), diff_mean_list.end());
     int min_index = std::distance(diff_mean_list.begin(), min_iter);
     auto fft_matching_end = std::chrono::high_resolution_clock::now();
-    std::cout << "[8] FFT matching (" << num_coarse_angles << " iterations, coarse): "
+    std::cout << "[6] FFT matching (" << num_coarse_angles << " iterations, coarse): "
               << std::chrono::duration_cast<std::chrono::milliseconds>(fft_matching_end - fft_matching_start).count()
               << " ms" << std::endl;
 
@@ -358,22 +410,48 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
     int detect_angle_coarse = min_index * COARSE_ANGLE_STEP;
     std::cout << "    Detected coarse angle: " << detect_angle_coarse << " degrees" << std::endl;
 
+    // 位置推定のため、元のスケールで必要な角度のみラドン変換を計算
     int angle_option1 = 180 - detect_angle_coarse;
     if (angle_option1 >= 180) angle_option1 -= 180;
-    
-    // 選択肢となるテンプレート行を取得
-    cv::Mat template_option1 = radon_transformed_template_float.row(angle_option1).clone();
-    cv::Mat template_option2;
-    cv::flip(template_option1, template_option2, 1);
-    cv::Mat target_img = radon_transformed_image_float.row(0).clone();
 
     int angle_option1_90 = angle_option1 + 90;
     if (angle_option1_90 >= 180) angle_option1_90 -= 180;
 
-    cv::Mat template_option1_90 = radon_transformed_template_float.row(angle_option1_90).clone();
+    // 必要な角度のみを抽出: 0, 90, angle_option1, angle_option1_90
+    std::vector<int> required_angles = {0, 90, angle_option1, angle_option1_90};
+
+    std::cout << "[7] Radon transform - template (256-pixel scale, " << required_angles.size() << " angles for position):" << std::endl;
+    auto radon_template_start = std::chrono::high_resolution_clock::now();
+    cv::Mat radon_transformed_template_orig = radonTransformAtAngles(templ_resized_angle, required_angles);
+    auto radon_template_end = std::chrono::high_resolution_clock::now();
+    std::cout << "  [Radon] Total time: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(radon_template_end - radon_template_start).count()
+              << " ms" << std::endl;
+
+    std::cout << "[8] Radon transform - image (256-pixel scale, " << required_angles.size() << " angles for position):" << std::endl;
+    auto radon_image_start = std::chrono::high_resolution_clock::now();
+    cv::Mat radon_transformed_image_orig = radonTransformAtAngles(image_resized_angle, required_angles);
+    auto radon_image_end = std::chrono::high_resolution_clock::now();
+    std::cout << "  [Radon] Total time: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(radon_image_end - radon_image_start).count()
+              << " ms" << std::endl;
+
+    cv::Mat radon_transformed_template_float, radon_transformed_image_float;
+    radon_transformed_template_orig.convertTo(radon_transformed_template_float, CV_32F);
+    radon_transformed_image_orig.convertTo(radon_transformed_image_float, CV_32F);
+
+    // 選択肢となるテンプレート行を取得（行インデックスは required_angles の順序に対応）
+    int idx_0 = 0, idx_90 = 1, idx_angle1 = 2, idx_angle1_90 = 3;
+
+    cv::Mat template_option1 = radon_transformed_template_float.row(idx_angle1).clone();
+    cv::Mat template_option2;
+    cv::flip(template_option1, template_option2, 1);
+    cv::Mat target_img = radon_transformed_image_float.row(idx_0).clone();
+
+    cv::Mat template_option1_90 = radon_transformed_template_float.row(idx_angle1_90).clone();
     cv::Mat template_option2_90;
     cv::flip(template_option1_90, template_option2_90, 1);
-    cv::Mat target_img_90 = radon_transformed_image_float.row(90).clone();
+    cv::Mat target_img_90 = radon_transformed_image_float.row(idx_90).clone();
 
     // マッチング
     auto matching_start = std::chrono::high_resolution_clock::now();
@@ -397,7 +475,7 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
     int min_val2_90_index = std::distance(result.begin(), min_val2_90_iter);
     float min_val2_90 = result[min_val2_90_index];
     auto matching_end = std::chrono::high_resolution_clock::now();
-    std::cout << "[9] 1D template matching (4 iterations): "
+    std::cout << "[9] 1D template matching (4 iterations, original scale): "
               << std::chrono::duration_cast<std::chrono::milliseconds>(matching_end - matching_start).count()
               << " ms" << std::endl;
 
@@ -407,16 +485,20 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
     int dx_option2 = min_val2_index + template_option2.cols / 2 - target_img.cols / 2;
     int dy_option2 = -(min_val2_90_index + template_option2.cols / 2 - target_img.cols / 2);
 
-    int target_angle, dx, dy;
+    int target_angle, dx_scaled, dy_scaled;
     if (min_val + min_val_90 < min_val2 + min_val2_90) {
         target_angle = detect_angle_coarse;
-        dx = dx_option1;
-        dy = dy_option1;
+        dx_scaled = dx_option1;
+        dy_scaled = dy_option1;
     } else {
         target_angle = detect_angle_coarse + 180;
-        dx = dx_option2;
-        dy = dy_option2;
+        dx_scaled = dx_option2;
+        dy_scaled = dy_option2;
     }
+
+    // 位置を元のスケールに戻す
+    int dx = static_cast<int>(dx_scaled / scale_angle);
+    int dy = static_cast<int>(dy_scaled / scale_angle);
 
     auto total_end = std::chrono::high_resolution_clock::now();
     std::cout << "\n========================================" << std::endl;
@@ -424,6 +506,7 @@ void matchTemplateRotatable(const cv::Mat &image, const cv::Mat &templ) {
               << std::chrono::duration_cast<std::chrono::milliseconds>(total_end - total_start).count()
               << " ms" << std::endl;
     std::cout << "========================================\n" << std::endl;
-    std::cout << "Detected: angle = " << target_angle << ", dx = " << dx << ", dy = " << dy << std::endl;
+    std::cout << "Detected (256-pixel scale): angle = " << target_angle << " degrees, dx = " << dx_scaled << ", dy = " << dy_scaled << std::endl;
+    std::cout << "Detected (original scale): angle = " << target_angle << " degrees, dx = " << dx << ", dy = " << dy << std::endl;
 }
 
