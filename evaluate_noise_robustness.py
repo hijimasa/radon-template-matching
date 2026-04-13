@@ -18,12 +18,64 @@ import math
 from numba import jit
 import time
 
-# Import core functions from main module
+# Import from main module (Hough voting algorithm)
 from radon_template_matching import (
-    getLinePoints, perpendicularSum, radonTransform,
-    centerPasteImage, matchTemplateOneLine,
-    radonTransformFloat, matchTemplateOneLineNCC, detectAnglePOC, detectPosition
+    getLinePoints, perpendicularSum, radonTransformFloat,
+    matchTemplateOneLineNCC, detectAngleHough, detectPosition
 )
+
+
+# =============================================================================
+# Legacy functions (kept here for comparison evaluation only)
+# =============================================================================
+
+@jit('uint8[:,:](uint8[:,:])', nopython=True, cache=True)
+def radonTransform(image):
+    """uint8ラドン変換（旧手法の比較評価用）"""
+    h, w = image.shape
+    line_length = int(math.sqrt(h*h+w*w))
+    perpendicular_width = int(math.sqrt(h*h+w*w))
+    angle_sums = []
+    max_value = np.uint64(0)
+    for angle in range(360):
+        line_points = getLinePoints(image, np.int32(angle), np.int32(line_length))
+        sums = perpendicularSum(image, line_points, perpendicular_width)
+        angle_sums.append(sums)
+        if max_value < max(sums):
+            max_value = max(sums)
+    normalized_image = np.zeros((360, line_length), dtype=np.uint32)
+    for i, sums in enumerate(angle_sums):
+        for j, value in enumerate(sums):
+            normalized_image[i, j] = (value / max_value) * 255
+    return normalized_image.astype(np.uint8)
+
+
+def centerPasteImage(wide_img, narrow_img):
+    """中心にペーストした画像を生成（旧手法の比較評価用）"""
+    wide_h, wide_w = wide_img.shape
+    narrow_h, narrow_w = narrow_img.shape
+    black_background = np.zeros((wide_h, wide_w), dtype=np.uint8)
+    x_offset = (wide_w - narrow_w) // 2
+    y_offset = (wide_h - narrow_h) // 2
+    black_background[y_offset:y_offset + narrow_h, x_offset:x_offset + narrow_w] = narrow_img
+    return black_background
+
+
+@jit('float32[:](float32[:], float32[:])', nopython=True, cache=True)
+def matchTemplateOneLine(image_line, template_line):
+    """旧1Dマッチング（比較評価用）"""
+    iteration_range = image_line.shape[0] - template_line.shape[0]
+    template_temp = template_line
+    template_temp_normalized = template_temp - np.mean(template_line)
+    diff_std_list = np.zeros(iteration_range, dtype=np.float32)
+    for i in range(iteration_range):
+        target_img_temp = image_line[i:i+template_line.shape[0]]
+        if not np.max(target_img_temp) == 0:
+            target_img_temp = (target_img_temp / np.mean(target_img_temp) * np.mean(template_temp)).astype(np.float32)
+        target_img_temp = target_img_temp - np.mean(target_img_temp)
+        diff = target_img_temp - template_temp_normalized
+        diff_std_list[i] = np.std(diff)
+    return diff_std_list
 
 
 # =============================================================================
@@ -555,57 +607,28 @@ def evaluate_angle_detection(image, template, true_angle, use_contrast_norm=Fals
         'contrast_ratio': contrast_ratio
     }
 
-    # 7. Improved POC (adaptive contrast normalization + uint8 Radon + POC)
-    # Adaptive contrast normalization
-    img_for_improved = image
+    # 7. Hough voting (adaptive contrast normalization + sinogram core matching)
+    img_for_hough = image
     cr = np.std(image.astype(np.float32)) / (np.std(template.astype(np.float32)) + 1e-10)
     if cr < 0.6:
         im_mean = np.mean(image.astype(np.float32))
         im_std = np.std(image.astype(np.float32))
         tm_mean = np.mean(template.astype(np.float32))
         tm_std = np.std(template.astype(np.float32))
-        img_for_improved = np.clip(
+        img_for_hough = np.clip(
             (image.astype(np.float32) - im_mean) / (im_std + 1e-10) * tm_std + tm_mean,
             0, 255).astype(np.uint8)
 
-    rows_t, cols_t = template.shape
-    x_t = np.linspace(-1, 1, cols_t)
-    y_t = np.linspace(-1, 1, rows_t)
-    x_t, y_t = np.meshgrid(x_t, y_t)
-    gw_tmpl = np.exp(-(x_t**2 + y_t**2) / (2 * 0.3**2))
-
-    rows_i, cols_i = img_for_improved.shape
-    x_i = np.linspace(-1, 1, cols_i)
-    y_i = np.linspace(-1, 1, rows_i)
-    x_i, y_i = np.meshgrid(x_i, y_i)
-    gw_img = np.exp(-(x_i**2 + y_i**2) / (2 * 0.5**2))
-
-    # uint8 Radon (noise-robust quantization) + POC
-    radon_img_imp = radonTransform((img_for_improved * gw_img).astype(np.uint8))
-    radon_tmpl_imp = radonTransform((template * gw_tmpl).astype(np.uint8))
-    radon_tmpl_imp_padded = centerPasteImage(radon_img_imp, radon_tmpl_imp)
-
-    fft_img_imp = np.array([np.fft.fft(radon_img_imp[i].astype(np.float32)) for i in range(360)], dtype=np.complex64)
-    fft_tmpl_imp = np.array([np.fft.fft(radon_tmpl_imp_padded[i].astype(np.float32)) for i in range(360)], dtype=np.complex64)
-
-    scores_improved = []
-    for shift in range(180):
-        corr_sum = 0.0
-        for j in range(180):
-            row1 = fft_img_imp[(shift + j) % 360]
-            row2 = fft_tmpl_imp[j]
-            cp = row1 * np.conj(row2)
-            cp_norm = cp / (np.abs(cp) + 1e-10)
-            corr = np.abs(np.fft.ifft(cp_norm))
-            corr_sum += np.max(corr)
-        scores_improved.append(corr_sum)
-    detected_angle_improved = int(np.argmax(scores_improved))
+    sino_img_h = radonTransformFloat(img_for_hough)
+    sino_tmpl_h = radonTransformFloat(template)
+    th, tw = template.shape
+    detected_angle_hough, _, _, scores_hough = detectAngleHough(sino_img_h, sino_tmpl_h, th, tw)
     results['ncc_sinogram'] = {
-        'detected_angle': detected_angle_improved,
-        'error': min(abs(detected_angle_improved - true_angle),
-                     abs(detected_angle_improved - true_angle + 180),
-                     abs(detected_angle_improved - true_angle - 180)),
-        'scores': scores_improved
+        'detected_angle': detected_angle_hough,
+        'error': min(abs(detected_angle_hough - true_angle),
+                     abs(detected_angle_hough - true_angle + 180),
+                     abs(detected_angle_hough - true_angle - 180)),
+        'scores': scores_hough
     }
 
     return results

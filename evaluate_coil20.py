@@ -17,9 +17,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from radon_template_matching import (
-    radonTransform, radonTransformFloat, centerPasteImage,
-    detectPosition, matchTemplateOneLineNCC,
-    detectAngleSinusoidalWarp, detectAngleHough
+    radonTransformFloat, detectAngleHough, detectPosition
 )
 
 
@@ -39,27 +37,6 @@ def create_test_image(template, true_angle, border_ratio=0.5):
     x0 = (frame_w - tw) // 2
     image[y0:y0+th, x0:x0+tw] = rotated
     return image
-
-
-def poc_angle_detect(radon_img, radon_tmpl_padded):
-    """POC angle detection from precomputed Radon transforms."""
-    fft_img = np.array([np.fft.fft(radon_img[i].astype(np.float32))
-                         for i in range(360)], dtype=np.complex64)
-    fft_tmpl = np.array([np.fft.fft(radon_tmpl_padded[i].astype(np.float32))
-                          for i in range(360)], dtype=np.complex64)
-
-    scores = np.zeros(180, dtype=np.float64)
-    for alpha in range(180):
-        corr_sum = 0.0
-        for theta in range(180):
-            row1 = fft_img[(theta + alpha) % 360]
-            row2 = fft_tmpl[theta]
-            cp = row1 * np.conj(row2)
-            cp_norm = cp / (np.abs(cp) + 1e-10)
-            corr = np.abs(np.fft.ifft(cp_norm))
-            corr_sum += np.max(corr)
-        scores[alpha] = corr_sum
-    return int(np.argmax(scores)), scores
 
 
 def evaluate_single(args):
