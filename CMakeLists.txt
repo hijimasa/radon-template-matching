@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 project(RadonTemplateMatching)
 
 # C++11を利用するように設定
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 
 # プロファイリング用のフラグ設定
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -pg")
