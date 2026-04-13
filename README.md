@@ -8,6 +8,8 @@ Rotation-invariant template matching using Hough voting on Radon sinograms
 
 ## Algorithm / アルゴリズム
 
+A point at (dx, dy) in the image traces a sinusoid `offset(θ) = dx·cos(θ) + dy·sin(θ)` in the Radon sinogram. Exploiting this geometric property, we extract the core (content-only projection) of each template sinogram row, match it against image sinogram rows via 1D sliding NCC, and apply Hough voting on the rotation angle from each match.
+
 画像上の1点 (dx, dy) はラドン変換のサイノグラム上で正弦波 `offset(θ) = dx·cos(θ) + dy·sin(θ)` を描く。この幾何学的性質を利用し、テンプレートのサイノグラムのコア（投影本体部分のみ）を画像のサイノグラム行とマッチングし、各一致結果から回転角度にハフ投票する。
 
 ### Processing Flow / 処理フロー
@@ -105,10 +107,11 @@ evaluate_noise_robustness.py ... Noise robustness comparison (legacy methods)
 
 ## Limitations / 制約
 
-- Template should occupy a significant portion (>40%) of the target image area.
-  テンプレートは対象画像の40%以上を占める必要がある
-- For small templates in large scenes, a pre-localization step is needed.
-  大きなシーンでの小さなテンプレートには事前の領域切り出しが必要
+- Designed for scenarios where the template is the dominant content in the image.
+  Benchmarked at ~25% area ratio (128x128 template in 256x256 image).
+  テンプレートが画像の主要コンテンツである場合に設計。面積比25%で検証済み
+- For small templates in large complex scenes, a pre-localization step is needed.
+  大きく複雑なシーンでの小さなテンプレートには事前の領域切り出しが必要
 - Angle resolution is 1° (sinogram computed at 360 angles).
   角度分解能は1°（360角度でサイノグラムを計算）
 
