@@ -1,3 +1,6 @@
+datasets/
+*.zip
+.vscode/
 __pycache__/
 build/
 CMakeLists.txt.user

@@ -20,8 +20,9 @@ import time
 
 # Import core functions from main module
 from radon_template_matching import (
-    getLinePoints, perpendicularSum, radonTransform, 
-    centerPasteImage, matchTemplateOneLine
+    getLinePoints, perpendicularSum, radonTransform,
+    centerPasteImage, matchTemplateOneLine,
+    radonTransformFloat, matchTemplateOneLineNCC, detectAnglePOC, detectPosition
 )
 
 
@@ -546,14 +547,67 @@ def evaluate_angle_detection(image, template, true_angle, use_contrast_norm=Fals
     )
     results['poc_adaptive'] = {
         'detected_angle': detected_angle_adapt,
-        'error': min(abs(detected_angle_adapt - true_angle), 
+        'error': min(abs(detected_angle_adapt - true_angle),
                      abs(detected_angle_adapt - true_angle + 180),
                      abs(detected_angle_adapt - true_angle - 180)),
         'scores': scores_adapt,
         'used_normalization': used_norm,
         'contrast_ratio': contrast_ratio
     }
-    
+
+    # 7. Improved POC (adaptive contrast normalization + uint8 Radon + POC)
+    # Adaptive contrast normalization
+    img_for_improved = image
+    cr = np.std(image.astype(np.float32)) / (np.std(template.astype(np.float32)) + 1e-10)
+    if cr < 0.6:
+        im_mean = np.mean(image.astype(np.float32))
+        im_std = np.std(image.astype(np.float32))
+        tm_mean = np.mean(template.astype(np.float32))
+        tm_std = np.std(template.astype(np.float32))
+        img_for_improved = np.clip(
+            (image.astype(np.float32) - im_mean) / (im_std + 1e-10) * tm_std + tm_mean,
+            0, 255).astype(np.uint8)
+
+    rows_t, cols_t = template.shape
+    x_t = np.linspace(-1, 1, cols_t)
+    y_t = np.linspace(-1, 1, rows_t)
+    x_t, y_t = np.meshgrid(x_t, y_t)
+    gw_tmpl = np.exp(-(x_t**2 + y_t**2) / (2 * 0.3**2))
+
+    rows_i, cols_i = img_for_improved.shape
+    x_i = np.linspace(-1, 1, cols_i)
+    y_i = np.linspace(-1, 1, rows_i)
+    x_i, y_i = np.meshgrid(x_i, y_i)
+    gw_img = np.exp(-(x_i**2 + y_i**2) / (2 * 0.5**2))
+
+    # uint8 Radon (noise-robust quantization) + POC
+    radon_img_imp = radonTransform((img_for_improved * gw_img).astype(np.uint8))
+    radon_tmpl_imp = radonTransform((template * gw_tmpl).astype(np.uint8))
+    radon_tmpl_imp_padded = centerPasteImage(radon_img_imp, radon_tmpl_imp)
+
+    fft_img_imp = np.array([np.fft.fft(radon_img_imp[i].astype(np.float32)) for i in range(360)], dtype=np.complex64)
+    fft_tmpl_imp = np.array([np.fft.fft(radon_tmpl_imp_padded[i].astype(np.float32)) for i in range(360)], dtype=np.complex64)
+
+    scores_improved = []
+    for shift in range(180):
+        corr_sum = 0.0
+        for j in range(180):
+            row1 = fft_img_imp[(shift + j) % 360]
+            row2 = fft_tmpl_imp[j]
+            cp = row1 * np.conj(row2)
+            cp_norm = cp / (np.abs(cp) + 1e-10)
+            corr = np.abs(np.fft.ifft(cp_norm))
+            corr_sum += np.max(corr)
+        scores_improved.append(corr_sum)
+    detected_angle_improved = int(np.argmax(scores_improved))
+    results['ncc_sinogram'] = {
+        'detected_angle': detected_angle_improved,
+        'error': min(abs(detected_angle_improved - true_angle),
+                     abs(detected_angle_improved - true_angle + 180),
+                     abs(detected_angle_improved - true_angle - 180)),
+        'scores': scores_improved
+    }
+
     return results
 
 
@@ -607,10 +661,11 @@ def run_evaluation(template, noise_configs, true_angle=30, true_dx=20, true_dy=-
         
         # 全手法のエラーを記録
         method_errors = {
-            'conventional': [], 
-            'phase_correlation': [], 
-            'poc_adaptive': [],      # 適応的POC（メイン手法）
+            'conventional': [],
+            'phase_correlation': [],
+            'poc_adaptive': [],      # 適応的POC
             'snr_weighted': [],
+            'ncc_sinogram': [],      # 改良NCC手法
         }
         normalization_used = []
         contrast_ratios = []
@@ -648,6 +703,7 @@ def run_evaluation(template, noise_configs, true_angle=30, true_dx=20, true_dy=-
         print(f"  POC (full):          {all_results[noise_name]['mean_errors']['phase_correlation']:.2f} ± {all_results[noise_name]['std_errors']['phase_correlation']:.2f} deg")
         print(f"  POC (adaptive):      {all_results[noise_name]['mean_errors']['poc_adaptive']:.2f} ± {all_results[noise_name]['std_errors']['poc_adaptive']:.2f} deg {norm_indicator}")
         print(f"  SNR Weighted:        {all_results[noise_name]['mean_errors']['snr_weighted']:.2f} ± {all_results[noise_name]['std_errors']['snr_weighted']:.2f} deg")
+        print(f"  Improved POC:        {all_results[noise_name]['mean_errors']['ncc_sinogram']:.2f} ± {all_results[noise_name]['std_errors']['ncc_sinogram']:.2f} deg")
         if norm_indicator:
             print(f"    → Contrast ratio: {all_results[noise_name]['mean_contrast_ratio']:.3f}, Normalization applied")
     
@@ -657,12 +713,12 @@ def run_evaluation(template, noise_configs, true_angle=30, true_dx=20, true_dy=-
 def plot_results(results, save_path=None):
     """結果を可視化"""
     noise_names = list(results.keys())
-    methods = ['conventional', 'phase_correlation', 'poc_adaptive', 'snr_weighted']
-    method_labels = ['Conventional', 'POC (full)', 'POC (adaptive)', 'SNR Weighted']
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
-    
+    methods = ['conventional', 'phase_correlation', 'poc_adaptive', 'snr_weighted', 'ncc_sinogram']
+    method_labels = ['Conventional', 'POC (full)', 'POC (adaptive)', 'SNR Weighted', 'Improved POC']
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+
     # エラーバープロット
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
     
     # 左: 平均誤差の比較
     ax1 = axes[0]
@@ -705,7 +761,7 @@ def plot_results(results, save_path=None):
 
 def plot_detailed_comparison(results, noise_type, save_path=None):
     """特定のノイズタイプに対する詳細比較"""
-    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    fig, axes = plt.subplots(2, 5, figsize=(22, 8))
     
     # 上段: 画像表示
     axes[0, 0].imshow(results[noise_type]['clean_image'], cmap='gray')
@@ -717,9 +773,9 @@ def plot_detailed_comparison(results, noise_type, save_path=None):
     axes[0, 1].axis('off')
     
     # 各手法の誤差分布
-    methods = ['conventional', 'phase_correlation', 'poc_adaptive', 'snr_weighted']
-    method_labels = ['Conventional', 'POC (full)', 'POC (adaptive)', 'SNR Weight']
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    methods = ['conventional', 'phase_correlation', 'poc_adaptive', 'snr_weighted', 'ncc_sinogram']
+    method_labels = ['Conventional', 'POC (full)', 'POC (adaptive)', 'SNR Weight', 'Improved POC']
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
     
     all_errors = results[noise_type]['all_errors']
     
@@ -740,10 +796,12 @@ def plot_detailed_comparison(results, noise_type, save_path=None):
         mean_err = results[noise_type]['mean_errors'][method]
         std_err = results[noise_type]['std_errors'][method]
         summary_text += f"{label}: {mean_err:.2f}° ± {std_err:.2f}°\n"
-    axes[0, 3].text(0.1, 0.5, summary_text, fontsize=11, verticalalignment='center', 
+    axes[0, 3].text(0.1, 0.5, summary_text, fontsize=9, verticalalignment='center',
                     family='monospace', transform=axes[0, 3].transAxes)
     axes[0, 3].set_title('Summary')
-    
+
+    axes[0, 4].axis('off')
+
     # 下段: 各ノイズタイプでの比較
     noise_names = list(results.keys())
     
@@ -839,23 +897,25 @@ if __name__ == "__main__":
     print("\n" + "=" * 100)
     print("Summary Table: POC (full) vs POC (adaptive)")
     print("=" * 100)
-    print(f"{'Noise Type':<18} {'Conventional':>12} {'POC(full)':>12} {'POC(adaptive)':>14} {'SNR Weight':>12} {'Norm?':>6}")
-    print("-" * 100)
+    print(f"{'Noise Type':<18} {'Conventional':>12} {'POC(full)':>12} {'POC(adaptive)':>14} {'SNR Weight':>12} {'Improved POC':>14} {'Norm?':>6}")
+    print("-" * 115)
     for noise_name in noise_configs:
         conv = results[noise_name]['mean_errors']['conventional']
         poc = results[noise_name]['mean_errors']['phase_correlation']
         poc_adapt = results[noise_name]['mean_errors']['poc_adaptive']
         snr = results[noise_name]['mean_errors']['snr_weighted']
+        ncc = results[noise_name]['mean_errors']['ncc_sinogram']
         norm_used = "✓" if results[noise_name].get('norm_used_ratio', 0) > 0.5 else ""
-        print(f"{noise_name:<18} {conv:>10.2f}° {poc:>10.2f}° {poc_adapt:>12.2f}° {snr:>10.2f}° {norm_used:>6}")
-    
+        print(f"{noise_name:<18} {conv:>10.2f}° {poc:>10.2f}° {poc_adapt:>12.2f}° {snr:>10.2f}° {ncc:>12.2f}° {norm_used:>6}")
+
     # 平均性能
-    print("-" * 100)
+    print("-" * 115)
     avg_conv = np.mean([results[n]['mean_errors']['conventional'] for n in noise_configs])
     avg_poc = np.mean([results[n]['mean_errors']['phase_correlation'] for n in noise_configs])
     avg_poc_adapt = np.mean([results[n]['mean_errors']['poc_adaptive'] for n in noise_configs])
     avg_snr = np.mean([results[n]['mean_errors']['snr_weighted'] for n in noise_configs])
-    print(f"{'Average':<18} {avg_conv:>10.2f}° {avg_poc:>10.2f}° {avg_poc_adapt:>12.2f}° {avg_snr:>10.2f}°")
+    avg_ncc = np.mean([results[n]['mean_errors']['ncc_sinogram'] for n in noise_configs])
+    print(f"{'Average':<18} {avg_conv:>10.2f}° {avg_poc:>10.2f}° {avg_poc_adapt:>12.2f}° {avg_snr:>10.2f}° {avg_ncc:>12.2f}°")
     
     # POC改善率
     print("\n" + "=" * 100)
