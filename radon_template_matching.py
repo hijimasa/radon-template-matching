@@ -326,14 +326,15 @@ def drawRotatedRectangleOnImage(image, center, width, height, angle,
 
 def matchTemplateRotatable(image, template):
     """
-    ラドン変換のハフ投票によるる回転不変テンプレートマッチング
+    ラドン変換のハフ投票による回転不変テンプレートマッチング
 
     処理フロー:
       1. 適応的コントラスト正規化（コントラスト比 < 0.6 の場合）
-      2. float32サイノグラム計算
-      3. ハフ投票による回転角度検出
-      4. 180度曖昧性の解消（detectPositionのスコア比較）
-      5. 結果の可視化
+      2. テンプレートにガウシアン窓（σ=1.0）を適用（クロップ端部の不連続を抑制）
+      3. float32サイノグラム計算
+      4. ハフ投票による回転角度検出
+      5. 180度曖昧性の解消（detectPositionのスコア比較）
+      6. 結果の可視化
 
     :param image: 対象画像 (グレースケール)
     :param template: テンプレート画像 (グレースケール)
@@ -342,26 +343,34 @@ def matchTemplateRotatable(image, template):
     th, tw = template.shape
 
     # Step 1: 適応的コントラスト正規化
-    contrast_ratio = np.std(image.astype(np.float32)) / (np.std(template.astype(np.float32)) + 1e-10)
-    if contrast_ratio < 0.6:
-        img_mean = np.mean(image.astype(np.float32))
-        img_std = np.std(image.astype(np.float32))
-        tmpl_mean = np.mean(template.astype(np.float32))
-        tmpl_std = np.std(template.astype(np.float32))
-        image_proc = (image.astype(np.float32) - img_mean) / (img_std + 1e-10) * tmpl_std + tmpl_mean
-        image_proc = np.clip(image_proc, 0, 255).astype(np.uint8)
+    cr = np.std(image.astype(np.float32)) / (np.std(template.astype(np.float32)) + 1e-10)
+    if cr < 0.6:
+        im_m = np.mean(image.astype(np.float32))
+        im_s = np.std(image.astype(np.float32))
+        tm_m = np.mean(template.astype(np.float32))
+        tm_s = np.std(template.astype(np.float32))
+        image_proc = np.clip(
+            (image.astype(np.float32) - im_m) / (im_s + 1e-10) * tm_s + tm_m,
+            0, 255).astype(np.uint8)
     else:
         image_proc = image
 
-    # Step 2: サイノグラム計算
-    sinogram_image = radonTransformFloat(image_proc)
-    sinogram_template = radonTransformFloat(template)
+    # Step 2: テンプレートにガウシアン窓（クロップ端部の不連続を抑制）
+    x = np.linspace(-1, 1, tw)
+    y = np.linspace(-1, 1, th)
+    x, y = np.meshgrid(x, y)
+    gw = np.exp(-(x**2 + y**2) / (2 * 1.0**2))
+    tmpl_windowed = (template.astype(np.float32) * gw).astype(np.uint8)
 
-    # Step 3: ハフ投票による角度・位置検出
+    # Step 3: サイノグラム計算
+    sinogram_image = radonTransformFloat(image_proc)
+    sinogram_template = radonTransformFloat(tmpl_windowed)
+
+    # Step 4: ハフ投票による角度・位置検出
     detect_angle, hough_dx, hough_dy, angle_scores = detectAngleHough(
         sinogram_image, sinogram_template, th, tw)
 
-    # Step 4: 180度曖昧性の解消
+    # Step 5: 180度曖昧性の解消
     _, _, score1 = detectPosition(sinogram_image, sinogram_template, detect_angle)
     _, _, score2 = detectPosition(sinogram_image, sinogram_template, detect_angle + 180)
 
@@ -375,33 +384,23 @@ def matchTemplateRotatable(image, template):
     print("detected: angle =", target_angle, ", dx =", dx, ", dy =", dy)
 
     # Step 5: 可視化
-    plt.subplot(3, 3, 1)
+    plt.subplot(2, 3, 1)
     plt.imshow(template, cmap='gray')
     plt.title('Template')
     plt.colorbar()
 
-    plt.subplot(3, 3, 2)
-    plt.imshow(sinogram_template, cmap='gray', aspect='auto')
-    plt.title('Sinogram (Template)')
-    plt.colorbar()
-
-    plt.subplot(3, 3, 3)
+    plt.subplot(2, 3, 2)
     plt.plot(range(180), angle_scores)
-    plt.axvline(x=detect_angle % 180, color='r', linestyle='--',
-                label=f'best={detect_angle}')
+    plt.axvline(x=target_angle % 180, color='r', linestyle='--',
+                label=f'best={target_angle}')
     plt.title('Hough Accumulator')
     plt.xlabel('Angle shift (deg)')
     plt.ylabel('Vote score')
     plt.legend()
 
-    plt.subplot(3, 3, 4)
+    plt.subplot(2, 3, 3)
     plt.imshow(image, cmap='gray')
     plt.title('Target')
-    plt.colorbar()
-
-    plt.subplot(3, 3, 5)
-    plt.imshow(sinogram_image, cmap='gray', aspect='auto')
-    plt.title('Sinogram (Target)')
     plt.colorbar()
 
     draw_color = (0, 0, 0)
@@ -410,7 +409,7 @@ def matchTemplateRotatable(image, template):
         (dx + image.shape[1] // 2, dy + image.shape[0] // 2),
         tw, th, target_angle, draw_color)
 
-    plt.subplot(3, 3, 7)
+    plt.subplot(2, 3, 4)
     plt.imshow(result_image, cmap='gray')
     plt.title('Matched Image')
     plt.colorbar()

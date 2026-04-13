@@ -114,6 +114,17 @@ evaluate_noise_robustness.py ... Noise robustness comparison (legacy methods)
   大きく複雑なシーンでの小さなテンプレートには事前の領域切り出しが必要
 - Angle resolution is 1° (sinogram computed at 360 angles).
   角度分解能は1°（360角度でサイノグラムを計算）
+- 180° ambiguity: Hough voting detects angle modulo 180°. The disambiguation
+  step (comparing detectPosition scores) may fail on complex natural images.
+  180°の曖昧性：ハフ投票は180°周期で角度を検出する。曖昧性の解消（detectPositionのスコア比較）は複雑な自然画像で失敗する場合がある
+
+## Known Issues / 今後の課題
+
+- **180° ambiguity resolution**: The current method uses `detectPosition` score
+  comparison, which is unreliable for natural images. Potential solutions include
+  using 2D NCC verification at the two candidate angles.
+  180°曖昧性の解消：現在のdetectPositionスコア比較は自然画像で不安定。
+  候補2角度での2D NCC検証が解決策として有望
 
 ## References / 参照
 

@@ -66,6 +66,25 @@ static std::vector<uint64_t> perpendicularSum(const cv::Mat &image,
     return sums;
 }
 
+cv::Mat applyGaussianWindow(const cv::Mat &image, double sigma) {
+    int h = image.rows, w = image.cols;
+    cv::Mat window(h, w, CV_32F);
+    double sigma2 = 2.0 * sigma * sigma;
+    for (int y = 0; y < h; y++) {
+        double ny = 2.0 * y / (h - 1) - 1.0;
+        for (int x = 0; x < w; x++) {
+            double nx = 2.0 * x / (w - 1) - 1.0;
+            window.at<float>(y, x) = static_cast<float>(std::exp(-(nx * nx + ny * ny) / sigma2));
+        }
+    }
+    cv::Mat float_img;
+    image.convertTo(float_img, CV_32F);
+    cv::Mat result;
+    cv::multiply(float_img, window, result);
+    result.convertTo(result, CV_8U);
+    return result;
+}
+
 cv::Mat radonTransformFloat(const cv::Mat &image) {
     int h = image.rows, w = image.cols;
     int line_length = static_cast<int>(std::sqrt(h * h + w * w));

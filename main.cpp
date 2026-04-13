@@ -60,7 +60,8 @@ int main() {
         // Radon transforms
         auto t0 = chrono::high_resolution_clock::now();
         Mat sino_img = radonTransformFloat(image);
-        Mat sino_tmpl = radonTransformFloat(templ);
+        Mat templ_windowed = applyGaussianWindow(templ, 1.0);
+        Mat sino_tmpl = radonTransformFloat(templ_windowed);
         auto t_radon = chrono::high_resolution_clock::now();
         double ms_radon = chrono::duration<double, milli>(t_radon - t0).count();
 
@@ -114,7 +115,7 @@ int main() {
         // Hough
         t0 = chrono::high_resolution_clock::now();
         Mat si = radonTransformFloat(img2);
-        Mat st = radonTransformFloat(t_resized);
+        Mat st = radonTransformFloat(applyGaussianWindow(t_resized, 1.0));
         auto hr = detectAngleHough(si, st, th2, tw2);
         t1 = chrono::high_resolution_clock::now();
         double ms_h = chrono::duration<double, milli>(t1 - t0).count();

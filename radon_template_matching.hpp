@@ -4,6 +4,9 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 
+// Apply Gaussian window to an image (reduces crop boundary artifacts)
+cv::Mat applyGaussianWindow(const cv::Mat &image, double sigma = 1.0);
+
 // Radon transform (float sinogram, 360 angles)
 cv::Mat radonTransformFloat(const cv::Mat &image);
 
