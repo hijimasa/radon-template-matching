@@ -85,6 +85,48 @@ int main() {
     }
 
     // =================================================================
+    // Method 3: 2-step (HF profile + 2D NCC)
+    // =================================================================
+    {
+        auto t0 = chrono::high_resolution_clock::now();
+
+        // Prepare sinogram and cores
+        Mat templ_windowed = applyGaussianWindow(templ, 1.0);
+        int pad_top = (fh - th) / 2, pad_bottom = fh - th - pad_top;
+        int pad_left = (fw - tw) / 2, pad_right = fw - tw - pad_left;
+        Mat tmpl_canvas;
+        copyMakeBorder(templ_windowed, tmpl_canvas,
+                       pad_top, pad_bottom, pad_left, pad_right,
+                       BORDER_CONSTANT, Scalar(0));
+        Mat sino_img = radonTransformFloat(image);
+        Mat sino_tmpl = radonTransformFloat(tmpl_canvas);
+        auto cores = extractSinogramCore(sino_tmpl, th, tw);
+        int n_img = sino_tmpl.cols;
+
+        auto t_prep = chrono::high_resolution_clock::now();
+        double ms_prep = chrono::duration<double, milli>(t_prep - t0).count();
+
+        // 2-step detection
+        auto result = detectByHFAndNCC(image, templ, sino_img, cores, n_img);
+        auto t1 = chrono::high_resolution_clock::now();
+        double ms_detect = chrono::duration<double, milli>(t1 - t_prep).count();
+        double ms_total = chrono::duration<double, milli>(t1 - t0).count();
+
+        int err = min({abs(result.angle - true_angle),
+                       abs(result.angle - true_angle + 360),
+                       abs(result.angle - true_angle - 360)});
+
+        cout << "[2-step: HF profile + NCC]" << endl;
+        cout << "  Prep:     " << ms_prep << " ms (Radon + cores)" << endl;
+        cout << "  Detect:   " << ms_detect << " ms" << endl;
+        cout << "  Total:    " << ms_total << " ms" << endl;
+        cout << "  Detected: " << result.angle << " deg (error: " << err << " deg)" << endl;
+        cout << "  Position: dx=" << result.dx << ", dy=" << result.dy << endl;
+        cout << "  NCC:      " << result.score << endl;
+        cout << endl;
+    }
+
+    // =================================================================
     // Benchmark: multiple sizes
     // =================================================================
     cout << "=== Scaling Benchmark ===" << endl;
