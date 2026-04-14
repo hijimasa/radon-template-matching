@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import math
+import time
 from numba import jit
 
 
@@ -338,59 +339,235 @@ def computeHFProfile(img_row, core, cutoff_ratio=1/8):
     return hf_energy[:nr]
 
 
+def precomputeNCCHFData(sinogram_image, cores, cutoff_ratio=1/8):
+    """
+    NCC-HFプロファイル用の事前計算。
+    HPF適用済み画像行のFFT・累積和と、HPF適用済みコアのFFT・統計量を計算する。
+    """
+    L = sinogram_image.shape[1]
+    c_L = max(1, int(L * cutoff_ratio))
+    hf_mask_L = np.ones(L, dtype=np.float64)
+    hf_mask_L[:c_L] = 0
+    hf_mask_L[-c_L + 1:] = 0
+
+    # 画像行: HPF → FFT保持, 累積和 (ローカル平均・分散用)
+    img_hf_fft = np.zeros((360, L), dtype=np.complex128)
+    img_cumsum = np.zeros((360, L + 1), dtype=np.float64)
+    img_cumsum_sq = np.zeros((360, L + 1), dtype=np.float64)
+    for i in range(360):
+        F = np.fft.fft(sinogram_image[i].astype(np.float64))
+        F *= hf_mask_L
+        img_hf_fft[i] = F
+        row_hf = np.real(np.fft.ifft(F))
+        img_cumsum[i, 1:] = np.cumsum(row_hf)
+        img_cumsum_sq[i, 1:] = np.cumsum(row_hf ** 2)
+
+    # コア: HPF (コア長基準) → ゼロパディングしてFFT, 平均・分散
+    core_hf_fft = [None] * 180
+    core_hf_mean = np.zeros(180, dtype=np.float64)
+    core_hf_energy = np.zeros(180, dtype=np.float64)  # nc * var
+    nc_list = np.zeros(180, dtype=np.int32)
+    valid = np.zeros(180, dtype=bool)
+
+    for j in range(180):
+        core = cores[j]
+        nc = len(core)
+        nc_list[j] = nc
+        if nc < 4 or nc >= L:
+            continue
+        c_nc = max(1, int(nc * cutoff_ratio))
+        Fc = np.fft.fft(core.astype(np.float64))
+        Fc[:c_nc] = 0
+        Fc[-c_nc + 1:] = 0
+        core_hf_real = np.real(np.fft.ifft(Fc))
+        core_hf_mean[j] = np.mean(core_hf_real)
+        core_hf_energy[j] = np.sum((core_hf_real - core_hf_mean[j]) ** 2)
+        # L長にゼロパディングしてFFT（相互相関用）
+        padded = np.zeros(L, dtype=np.float64)
+        padded[:nc] = core_hf_real
+        core_hf_fft[j] = np.fft.fft(padded)
+        valid[j] = True
+
+    return {
+        'img_hf_fft': img_hf_fft,
+        'img_cumsum': img_cumsum,
+        'img_cumsum_sq': img_cumsum_sq,
+        'core_hf_fft': core_hf_fft,
+        'core_hf_mean': core_hf_mean,
+        'core_hf_energy': core_hf_energy,
+        'nc_list': nc_list,
+        'valid': valid,
+        'L': L,
+    }
+
+
+def precomputeHFData(sinogram_image, cores, cutoff_ratio=1/8):
+    """
+    全行のforward FFTとHPフィルタ適用を事前計算する。
+    画像行のFFTは角度αに依存せず、コアのFFTはテンプレート角度jにのみ依存するため、
+    ループ外で1回だけ計算すればよい。
+
+    :param sinogram_image: ターゲットのサイノグラム (360 x L)
+    :param cores: テンプレートのサイノグラムコア (360個, 0-179のみ使用)
+    :param cutoff_ratio: ハイパスフィルタのカットオフ比率
+    :return: 事前計算データの辞書
+    """
+    L = sinogram_image.shape[1]
+    c = max(1, int(L * cutoff_ratio))
+
+    # HPマスク（全行共通）
+    hf_mask = np.ones(L, dtype=np.float64)
+    hf_mask[:c] = 0
+    hf_mask[-c + 1:] = 0
+
+    # 画像行のFFT → HPフィルタ適用 (360行)
+    A_hf = []
+    sum_A2 = np.zeros(360, dtype=np.float64)
+    for i in range(360):
+        A = np.fft.fft(sinogram_image[i].astype(np.float64))
+        a_hf = A * hf_mask
+        A_hf.append(a_hf)
+        sum_A2[i] = np.sum(np.abs(a_hf) ** 2) / L
+
+    # テンプレートコアのFFT → HPフィルタ適用 (180行)
+    B_hf = [None] * 180
+    sum_B2 = np.zeros(180, dtype=np.float64)
+    nc_list = np.zeros(180, dtype=np.int32)
+    for j in range(180):
+        core = cores[j]
+        nc = len(core)
+        nc_list[j] = nc
+        if nc < 4 or nc >= L:
+            continue
+        core_padded = np.zeros(L, dtype=np.float64)
+        core_padded[:nc] = core.astype(np.float64)
+        B = np.fft.fft(core_padded)
+        b_hf = B * hf_mask
+        B_hf[j] = b_hf
+        sum_B2[j] = np.sum(np.abs(b_hf) ** 2) / L
+
+    # 行列形式に変換（fancy indexingの高速化）
+    A_hf_matrix = np.array(A_hf)         # (360, L)
+    B_hf_matrix = np.zeros((180, L), dtype=np.complex128)
+    B_hf_valid = np.zeros(180, dtype=bool)
+    for j in range(180):
+        if B_hf[j] is not None:
+            B_hf_matrix[j] = B_hf[j]
+            B_hf_valid[j] = True
+
+    return {
+        'A_hf_matrix': A_hf_matrix,
+        'B_hf_matrix': B_hf_matrix,
+        'B_hf_valid': B_hf_valid,
+        'sum_A2': sum_A2,
+        'sum_B2': sum_B2,
+        'L': L,
+        'nc_list': nc_list,
+        # 後方互換のために残す
+        'A_hf': A_hf,
+        'B_hf': B_hf,
+    }
+
+
 def findPositionByHFProfile(sino_img, cores, alpha, n_img, center_t,
-                            cos_t, sin_t, max_dx, max_dy):
+                            cos_t, sin_t, max_dx, max_dy, hf_data=None):
     """
     角度αで全行のHFプロファイルを計算し、正弦波パスで最良(dx, dy)を推定。
 
-    行の対応: image[i] ↔ template[(i + α) % 360]
+    行の対応: image[i] ↔ template[(i - α) % 360]
 
-    :return: (best_dx, best_dy)
+    :return: (best_dx, best_dy, best_energy)
     """
-    # HFプロファイル事前計算
-    profiles = {}
-    for i in range(360):
-        j = (i - alpha) % 360
-        if j >= 180:
-            continue
-        core = cores[j]
-        if len(core) < 4 or len(core) >= n_img:
-            continue
-        prof = computeHFProfile(sino_img[i], core)
-        profiles[i] = (prof, len(core))
+    # HFプロファイル計算
+    if hf_data is not None:
+        L = hf_data['L']
+        # 有効な(i, j)ペアを収集
+        valid_i = []
+        valid_j = []
+        for i in range(360):
+            j = (i - alpha) % 360
+            if j >= 180:
+                continue
+            if hf_data['B_hf'][j] is None:
+                continue
+            nc = int(hf_data['nc_list'][j])
+            if L - nc + 1 <= 0:
+                continue
+            valid_i.append(i)
+            valid_j.append(j)
 
-    if len(profiles) == 0:
-        return 0, 0
+        if len(valid_i) == 0:
+            return 0, 0
 
-    # ベクトル化の準備
-    row_indices = sorted(profiles.keys())
-    prof_list = [profiles[i][0] for i in row_indices]
-    nc_list = np.array([profiles[i][1] for i in row_indices])
-    cos_vals = cos_t[row_indices]
-    sin_vals = sin_t[row_indices]
-    prof_lens = np.array([len(p) for p in prof_list])
-    n_rows = len(row_indices)
+        n_rows = len(valid_i)
+        nc_arr = hf_data['nc_list'][valid_j]
 
-    max_prof_len = max(prof_lens)
-    prof_matrix = np.full((n_rows, max_prof_len), np.inf, dtype=np.float64)
-    for k in range(n_rows):
-        prof_matrix[k, :prof_lens[k]] = prof_list[k]
+        # バッチ: cross_hf行列を構築 → 一括IFFT
+        A_mat = np.array([hf_data['A_hf'][i] for i in valid_i])  # (n_rows, L)
+        B_mat = np.array([hf_data['B_hf'][j] for j in valid_j])  # (n_rows, L)
+        constants = hf_data['sum_A2'][valid_i] + hf_data['sum_B2'][valid_j]  # (n_rows,)
+
+        cross_hf_mat = A_mat * np.conj(B_mat)                     # (n_rows, L)
+        cross_spatial = np.real(np.fft.ifft(cross_hf_mat, axis=1)) # (n_rows, L) 一括IFFT
+
+        # E_HF(p) = const - 2/L * Re(cross_spatial[p])
+        prof_matrix_full = constants[:, None] - 2.0 / L * cross_spatial  # (n_rows, L)
+
+        # 有効範囲外をinfで埋めたプロファイル行列を構築
+        prof_lens = L - nc_arr + 1
+        max_prof_len = int(np.max(prof_lens))
+        prof_matrix = np.full((n_rows, max_prof_len), np.inf, dtype=np.float64)
+        for k in range(n_rows):
+            prof_matrix[k, :prof_lens[k]] = prof_matrix_full[k, :prof_lens[k]]
+
+        row_indices = valid_i
+        nc_list = nc_arr
+        cos_vals = cos_t[row_indices]
+        sin_vals = sin_t[row_indices]
+    else:
+        profiles = {}
+        for i in range(360):
+            j = (i - alpha) % 360
+            if j >= 180:
+                continue
+            core = cores[j]
+            if len(core) < 4 or len(core) >= n_img:
+                continue
+            prof = computeHFProfile(sino_img[i], core)
+            profiles[i] = (prof, len(core))
+
+        if len(profiles) == 0:
+            return 0, 0
+
+        row_indices = sorted(profiles.keys())
+        prof_list = [profiles[i][0] for i in row_indices]
+        nc_list = np.array([profiles[i][1] for i in row_indices])
+        cos_vals = cos_t[row_indices]
+        sin_vals = sin_t[row_indices]
+        prof_lens = np.array([len(p) for p in prof_list])
+        n_rows = len(row_indices)
+
+        max_prof_len = max(prof_lens)
+        prof_matrix = np.full((n_rows, max_prof_len), np.inf, dtype=np.float64)
+        for k in range(n_rows):
+            prof_matrix[k, :prof_lens[k]] = prof_list[k]
 
     def eval_positions_batch(dx_arr, dy_arr):
-        best_dx, best_dy, best_e = 0, 0, np.inf
-        for dx in dx_arr:
-            base_offsets = dx * cos_vals
-            for dy in dy_arr:
-                offsets = base_offsets - dy * sin_vals
-                positions = np.round(center_t + offsets - nc_list / 2.0).astype(int)
-                np.clip(positions, 0, prof_lens - 1, out=positions)
-                total = np.sum(prof_matrix[np.arange(n_rows), positions])
-                avg = total / n_rows
-                if avg < best_e:
-                    best_e = avg
-                    best_dx = dx
-                    best_dy = dy
-        return best_dx, best_dy, best_e
+        # 全(dx, dy)を一括評価: (n_dx, n_dy, n_rows) のブロードキャスト演算
+        # offsets[d, e, k] = dx_arr[d]*cos_vals[k] - dy_arr[e]*sin_vals[k]
+        offsets = (dx_arr[:, None, None] * cos_vals[None, None, :]
+                   - dy_arr[None, :, None] * sin_vals[None, None, :])
+        positions = np.round(center_t + offsets - nc_list[None, None, :] / 2.0).astype(np.intp)
+        np.clip(positions, 0, (prof_lens - 1)[None, None, :], out=positions)
+
+        # 各(dx, dy)でのHFエネルギー合計
+        row_idx = np.arange(n_rows)[None, None, :]
+        energies = prof_matrix[row_idx, positions]   # (n_dx, n_dy, n_rows)
+        totals = np.mean(energies, axis=2)           # (n_dx, n_dy)
+
+        min_flat = np.argmin(totals)
+        di, dj = np.unravel_index(min_flat, totals.shape)
+        return int(dx_arr[di]), int(dy_arr[dj]), totals[di, dj]
 
     # 粗い位置探索 (step=2)
     dx_range = np.arange(-max_dx, max_dx + 1, 2)
@@ -400,9 +577,104 @@ def findPositionByHFProfile(sino_img, cores, alpha, n_img, center_t,
     # 精密探索 (step=1, ±2px)
     dx_fine = np.arange(max(best_dx - 2, -max_dx), min(best_dx + 3, max_dx + 1))
     dy_fine = np.arange(max(best_dy - 2, -max_dy), min(best_dy + 3, max_dy + 1))
-    fine_dx, fine_dy, _ = eval_positions_batch(dx_fine, dy_fine)
+    fine_dx, fine_dy, fine_e = eval_positions_batch(dx_fine, dy_fine)
 
-    return fine_dx, fine_dy
+    return fine_dx, fine_dy, fine_e
+
+
+def findPositionByNCCHF(sino_img, cores, alpha, n_img, center_t,
+                        cos_t, sin_t, max_dx, max_dy, ncc_data=None):
+    """
+    NCC-HF版: HPF適用済みサイノグラムのローカルNCC最大化で(dx, dy)を推定。
+
+    HFエネルギー版と異なり、コア領域のみの正規化相関を使うため
+    背景ベースラインの影響を受けない。
+
+    :return: (best_dx, best_dy, best_ncc_score)
+    """
+    if ncc_data is None:
+        return 0, 0, -np.inf
+
+    L = ncc_data['L']
+    # 有効な(i, j)ペアを収集
+    valid_i = []
+    valid_j = []
+    for i in range(360):
+        j = (i - alpha) % 360
+        if j >= 180:
+            continue
+        if not ncc_data['valid'][j]:
+            continue
+        nc = int(ncc_data['nc_list'][j])
+        if L - nc + 1 <= 0:
+            continue
+        valid_i.append(i)
+        valid_j.append(j)
+
+    if len(valid_i) == 0:
+        return 0, 0, -np.inf
+
+    n_rows = len(valid_i)
+    nc_arr = ncc_data['nc_list'][valid_j].astype(np.float64)
+
+    # バッチ相互相関: IFFT(img_hf_fft[i] * conj(core_hf_fft[j]))
+    A_mat = ncc_data['img_hf_fft'][valid_i]                        # (n_rows, L)
+    B_mat = np.array([ncc_data['core_hf_fft'][j] for j in valid_j])  # (n_rows, L)
+    cross_spatial = np.real(np.fft.ifft(A_mat * np.conj(B_mat), axis=1))  # (n_rows, L)
+
+    # ローカル統計量 (cumsum から window size nc_arr[k] で計算)
+    cs = ncc_data['img_cumsum']      # (360, L+1)
+    css = ncc_data['img_cumsum_sq']  # (360, L+1)
+    core_mean = ncc_data['core_hf_mean'][valid_j]    # (n_rows,)
+    core_energy = ncc_data['core_hf_energy'][valid_j]  # (n_rows,)
+
+    # NCCプロファイル行列: ncc[k][p] = (cross[p]/nc - μ_img(p)*μ_core) / sqrt(σ²_img(p) * Σ(core-μ)²/nc)
+    prof_lens = (L - nc_arr + 1).astype(int)
+    max_prof_len = int(np.max(prof_lens))
+    prof_matrix = np.full((n_rows, max_prof_len), -np.inf, dtype=np.float64)
+
+    for k in range(n_rows):
+        i_idx = valid_i[k]
+        nc = int(nc_arr[k])
+        nr = int(prof_lens[k])
+        # ローカル平均・分散
+        local_sum = cs[i_idx, nc:nc + nr] - cs[i_idx, :nr]
+        local_sum_sq = css[i_idx, nc:nc + nr] - css[i_idx, :nr]
+        local_mean = local_sum / nc
+        local_var = local_sum_sq / nc - local_mean ** 2
+        local_var = np.maximum(local_var, 0)  # 数値誤差対策
+        # NCC
+        denom = np.sqrt(local_var * core_energy[k])
+        numerator = cross_spatial[k, :nr] / nc - local_mean * core_mean[k]
+        safe = denom > 1e-10
+        prof_matrix[k, :nr] = np.where(safe, numerator / np.where(safe, denom, 1), 0)
+
+    cos_vals = cos_t[valid_i]
+    sin_vals = sin_t[valid_i]
+
+    def eval_positions_batch(dx_arr, dy_arr):
+        offsets = (dx_arr[:, None, None] * cos_vals[None, None, :]
+                   - dy_arr[None, :, None] * sin_vals[None, None, :])
+        positions = np.round(center_t + offsets - nc_arr[None, None, :] / 2.0).astype(np.intp)
+        np.clip(positions, 0, (prof_lens - 1)[None, None, :].astype(np.intp), out=positions)
+        row_idx = np.arange(n_rows)[None, None, :]
+        ncc_vals = prof_matrix[row_idx, positions]
+        totals = np.mean(ncc_vals, axis=2)
+        max_flat = np.argmax(totals)
+        di, dj = np.unravel_index(max_flat, totals.shape)
+        return int(dx_arr[di]), int(dy_arr[dj]), totals[di, dj]
+
+    # 粗い位置探索 (step=2)
+    dx_range = np.arange(-max_dx, max_dx + 1, 2)
+    dy_range = np.arange(-max_dy, max_dy + 1, 2)
+    best_dx, best_dy, _ = eval_positions_batch(dx_range, dy_range)
+
+    # 精密探索 (step=1, ±2px)
+    dx_fine = np.arange(max(best_dx - 2, -max_dx), min(best_dx + 3, max_dx + 1))
+    dy_fine = np.arange(max(best_dy - 2, -max_dy), min(best_dy + 3, max_dy + 1))
+    fine_dx, fine_dy, fine_score = eval_positions_batch(dx_fine, dy_fine)
+
+    return fine_dx, fine_dy, fine_score
 
 
 def refineByNCC(image, template, coarse_angle, coarse_dx, coarse_dy,
@@ -486,22 +758,40 @@ def detectByHFAndNCC(image, template, sinogram_image, cores, n_img,
     max_dx = (img_w - tw) // 2 - 2
     max_dy = (img_h - th) // 2 - 2
 
-    # Step 1: 各角度で位置粗推定
+    # FFT事前計算（全行のforward FFTを1回だけ実行）
+    t0 = time.time()
+    hf_data = precomputeHFData(sinogram_image, cores)
+    t_precomp = time.time() - t0
+    print(f"  HF precompute: {t_precomp:.3f}s (540 FFTs)")
+
+    # Step 1: 各角度で位置粗推定（HFエネルギースコア付き）
+    t0 = time.time()
     candidates = []
     for alpha in range(0, 360, angle_step_coarse):
-        dx_est, dy_est = findPositionByHFProfile(
+        dx_est, dy_est, hf_energy = findPositionByHFProfile(
             sinogram_image, cores, alpha, n_img, center_t,
-            cos_t, sin_t, max_dx, max_dy)
-        candidates.append((alpha, dx_est, dy_est))
+            cos_t, sin_t, max_dx, max_dy, hf_data=hf_data)
+        candidates.append((alpha, dx_est, dy_est, hf_energy))
+    t_step1 = time.time() - t0
+    n_angles = 360 // angle_step_coarse
+    print(f"  HF position search: {t_step1:.3f}s ({n_angles} angles)")
 
-    # Step 2: 各候補の近傍で2D NCC精密化、最良を選択
+    # HFエネルギーで上位K候補に絞り込み（低エネルギー=良い一致）
+    top_k = 20
+    candidates.sort(key=lambda c: c[3])
+    candidates = candidates[:top_k]
+
+    # Step 2: 上位候補の近傍で2D NCC精密化、最良を選択
+    t0 = time.time()
     best = (0, 0, 0, -np.inf)
-    for ca, cdx, cdy in candidates:
+    for ca, cdx, cdy, _ in candidates:
         a, dx, dy, score = refineByNCC(
             image, template, ca, cdx, cdy,
             angle_range=angle_step_coarse, pos_range=3)
         if score > best[3]:
             best = (a, dx, dy, score)
+    t_step2 = time.time() - t0
+    print(f"  NCC refinement: {t_step2:.3f}s (top {top_k} candidates)")
 
     return best
 
@@ -576,20 +866,31 @@ def matchTemplateRotatable(image, template):
     gw = np.exp(-(x**2 + y**2) / (2 * 1.0**2))
     tmpl_windowed = (template.astype(np.float32) * gw).astype(np.uint8)
 
+    # 画像のcorner_pixels_meanでキャンバスを充填（サイノグラム境界外の基準を統一）
+    cm = int((np.mean(image_proc[0, :]) + np.mean(image_proc[-1, :]) +
+              np.mean(image_proc[:, 0]) + np.mean(image_proc[:, -1])) / 4.0)
     tmpl_canvas = cv2.copyMakeBorder(
         tmpl_windowed,
         (img_h - th) // 2, img_h - th - (img_h - th) // 2,
         (img_w - tw) // 2, img_w - tw - (img_w - tw) // 2,
-        cv2.BORDER_CONSTANT, value=0)
+        cv2.BORDER_CONSTANT, value=cm)
+    t_start = time.time()
     sinogram_image = radonTransformFloat(image_proc)
     sinogram_template = radonTransformFloat(tmpl_canvas)
+    t_radon = time.time() - t_start
+    print(f"Radon transform: {t_radon:.3f}s")
+
     cores = extractSinogramCore(sinogram_template, th, tw)
     n_img = sinogram_template.shape[1]
 
     # Step 3-4: 2段階検出（HFプロファイル粗推定 + 2D NCC精密化）
+    t_detect = time.time()
     target_angle, dx, dy, ncc_score = detectByHFAndNCC(
         image_proc, template, sinogram_image, cores, n_img)
+    t_detect = time.time() - t_detect
 
+    print(f"Detection total: {t_detect:.3f}s")
+    print(f"Overall: {time.time() - t_start:.3f}s")
     print("detected: angle =", target_angle, ", dx =", dx, ", dy =", dy,
           ", ncc =", f"{ncc_score:.4f}")
 
