@@ -294,6 +294,165 @@ def detectPosition(sinogram_image, sinogram_template, detect_angle, num_angles=3
 
 
 # =============================================================================
+# HF Energy Refinement / 高周波エネルギー精密推定
+# =============================================================================
+
+def isTemplateInside(angle, dx, dy, tw, th, img_h, img_w, margin=2):
+    """
+    回転後のテンプレートが画像内に完全に収まるか判定する。
+
+    :param angle: 回転角度（度）
+    :param dx: x方向オフセット（画像中心基準）
+    :param dy: y方向オフセット（画像中心基準）
+    :param tw: テンプレート幅
+    :param th: テンプレート高さ
+    :param img_h: 画像の高さ
+    :param img_w: 画像の幅
+    :param margin: 境界マージン（ピクセル）
+    :return: True/False
+    """
+    corners = np.array([[-tw / 2, -th / 2], [tw / 2, -th / 2],
+                        [tw / 2, th / 2], [-tw / 2, th / 2]])
+    rad = np.deg2rad(angle)
+    R = np.array([[np.cos(rad), -np.sin(rad)],
+                  [np.sin(rad), np.cos(rad)]])
+    rotated = corners @ R.T
+    abs_x = rotated[:, 0] + img_w / 2.0 + dx
+    abs_y = rotated[:, 1] + img_h / 2.0 + dy
+    return (abs_x.min() >= margin and abs_x.max() <= img_w - margin and
+            abs_y.min() >= margin and abs_y.max() <= img_h - margin)
+
+
+def highpassEnergy(sinogram, cutoff_ratio=1/8):
+    """
+    サイノグラムの各行にハイパスフィルタを適用し、高周波エネルギーを計算。
+
+    :param sinogram: (360, L) サイノグラム
+    :param cutoff_ratio: 低周波カットオフ比率
+    :return: 高周波エネルギー（スカラー）
+    """
+    total_hf = 0.0
+    for i in range(sinogram.shape[0]):
+        row = sinogram[i].astype(np.float64)
+        fft_row = np.fft.fft(row)
+        n = len(fft_row)
+        cutoff = max(1, int(n * cutoff_ratio))
+        fft_row[:cutoff] = 0
+        fft_row[-cutoff + 1:] = 0
+        hf = np.real(np.fft.ifft(fft_row))
+        total_hf += np.sum(hf ** 2)
+    return total_hf
+
+
+def makeTemplSinogram(template, angle, dx, dy, img_h, img_w):
+    """
+    指定姿勢でテンプレートを画像サイズのキャンバスに配置し、サイノグラムを計算。
+
+    :param template: テンプレート画像 (グレースケール)
+    :param angle: 回転角度（度）
+    :param dx: x方向オフセット（画像中心基準）
+    :param dy: y方向オフセット（画像中心基準）
+    :param img_h: ターゲット画像の高さ
+    :param img_w: ターゲット画像の幅
+    :return: (360, L) サイノグラム
+    """
+    th, tw = template.shape
+    M = cv2.getRotationMatrix2D((tw // 2, th // 2), -angle, 1.0)
+    tmpl_rot = cv2.warpAffine(template, M, (tw, th),
+                               borderMode=cv2.BORDER_REPLICATE)
+    canvas = np.zeros((img_h, img_w), dtype=np.uint8)
+    cy, cx = img_h // 2, img_w // 2
+    y1 = cy - th // 2 + dy
+    x1 = cx - tw // 2 + dx
+    canvas[y1:y1 + th, x1:x1 + tw] = tmpl_rot
+    return radonTransformFloat(canvas)
+
+
+def detectByHFEnergy(sinogram_image, template, img_h, img_w,
+                     pos_step_coarse=2):
+    """
+    HFエネルギー最小化のみでテンプレートの姿勢 (angle, dx, dy) を検出する。
+    ハフ投票には依存しない。
+
+    交互最適化による探索:
+      Phase 1: 角度全探索 0-359°（dx=0, dy=0 固定）
+      Phase 2: (dx, dy) 2Dスイープ（Phase 1 の角度で固定）
+      Phase 3: 角度を再探索（Phase 2 の位置で固定） — 位置のずれによる角度誤差を修正
+      Phase 4: (dx, dy) を再探索（Phase 3 の角度で固定）
+      Phase 5: (angle, dx, dy) 局所精密探索（step=1）
+
+    :param sinogram_image: ターゲット画像のサイノグラム
+    :param template: テンプレート画像（元画像）
+    :param img_h: ターゲット画像の高さ
+    :param img_w: ターゲット画像の幅
+    :param pos_step_coarse: Phase 2/4 の位置探索ステップ（ピクセル）
+    :return: (best_angle, best_dx, best_dy, best_hf_energy)
+    """
+    th, tw = template.shape
+    sino_img = sinogram_image.astype(np.float64)
+
+    def eval_hf(a, dx, dy):
+        if not isTemplateInside(a, dx, dy, tw, th, img_h, img_w):
+            return np.inf
+        sino_t = makeTemplSinogram(template, a, dx, dy, img_h, img_w)
+        residual = sino_img - sino_t.astype(np.float64)
+        return highpassEnergy(residual)
+
+    # 位置探索範囲の算出（テンプレートが画像内に収まる最大範囲）
+    max_dx = (img_w - tw) // 2 - 2
+    max_dy = (img_h - th) // 2 - 2
+
+    def sweep_angle(dx, dy):
+        """全角度 0-359° をスイープし、最良角度とエネルギーを返す"""
+        ba, be = 0, np.inf
+        for a in range(360):
+            e = eval_hf(a, dx, dy)
+            if e < be:
+                be = e
+                ba = a
+        return ba, be
+
+    def sweep_position(angle, step):
+        """(dx, dy) を画像内制約範囲で2Dスイープ"""
+        bd, bdy, be = 0, 0, np.inf
+        for dx in range(-max_dx, max_dx + 1, step):
+            for dy in range(-max_dy, max_dy + 1, step):
+                e = eval_hf(angle, dx, dy)
+                if e < be:
+                    be = e
+                    bd = dx
+                    bdy = dy
+        return bd, bdy, be
+
+    # Phase 1: 角度全探索（位置は中央固定）
+    best_a, best_e = sweep_angle(0, 0)
+
+    # Phase 2: 位置スイープ（Phase 1 の角度で固定）
+    best_dx, best_dy, best_e = sweep_position(best_a, pos_step_coarse)
+
+    # Phase 3: 角度を再探索（正しい位置で角度誤差を修正）
+    best_a, best_e = sweep_angle(best_dx, best_dy)
+
+    # Phase 4: 位置を再探索（修正された角度で）
+    best_dx, best_dy, best_e = sweep_position(best_a, pos_step_coarse)
+
+    # Phase 5: 局所精密探索（±3度, ±pos_step_coarseピクセル, step=1）
+    fine_a, fine_dx, fine_dy = best_a, best_dx, best_dy
+    for a in range(best_a - 3, best_a + 4):
+        a_mod = a % 360
+        for dx in range(best_dx - pos_step_coarse, best_dx + pos_step_coarse + 1):
+            for dy in range(best_dy - pos_step_coarse, best_dy + pos_step_coarse + 1):
+                e = eval_hf(a_mod, dx, dy)
+                if e < best_e:
+                    best_e = e
+                    fine_a = a_mod
+                    fine_dx = dx
+                    fine_dy = dy
+
+    return fine_a, fine_dx, fine_dy, best_e
+
+
+# =============================================================================
 # Drawing / 描画
 # =============================================================================
 
@@ -326,21 +485,23 @@ def drawRotatedRectangleOnImage(image, center, width, height, angle,
 
 def matchTemplateRotatable(image, template):
     """
-    ラドン変換のハフ投票による回転不変テンプレートマッチング
+    残差サイノグラムのHFエネルギー最小化による回転不変テンプレートマッチング
 
     処理フロー:
       1. 適応的コントラスト正規化（コントラスト比 < 0.6 の場合）
-      2. テンプレートにガウシアン窓（σ=1.0）を適用（クロップ端部の不連続を抑制）
-      3. float32サイノグラム計算
-      4. ハフ投票による回転角度検出
-      5. 180度曖昧性の解消（detectPositionのスコア比較）
-      6. 結果の可視化
+      2. ターゲット画像のサイノグラム計算
+      3. HFエネルギー最小化で姿勢 (angle, dx, dy) を検出
+         Phase 1: 角度全探索 0-359°
+         Phase 2: 位置2D探索
+         Phase 3: 局所精密探索
+      4. 結果の可視化
 
     :param image: 対象画像 (グレースケール)
     :param template: テンプレート画像 (グレースケール)
     :return: (target_angle, dx, dy)
     """
     th, tw = template.shape
+    img_h, img_w = image.shape
 
     # Step 1: 適応的コントラスト正規化
     cr = np.std(image.astype(np.float32)) / (np.std(template.astype(np.float32)) + 1e-10)
@@ -355,50 +516,22 @@ def matchTemplateRotatable(image, template):
     else:
         image_proc = image
 
-    # Step 2: テンプレートにガウシアン窓（クロップ端部の不連続を抑制）
-    x = np.linspace(-1, 1, tw)
-    y = np.linspace(-1, 1, th)
-    x, y = np.meshgrid(x, y)
-    gw = np.exp(-(x**2 + y**2) / (2 * 1.0**2))
-    tmpl_windowed = (template.astype(np.float32) * gw).astype(np.uint8)
-
-    # Step 3: サイノグラム計算
+    # Step 2: ターゲット画像のサイノグラム計算
     sinogram_image = radonTransformFloat(image_proc)
-    sinogram_template = radonTransformFloat(tmpl_windowed)
 
-    # Step 4: ハフ投票による角度・位置検出
-    detect_angle, hough_dx, hough_dy, angle_scores = detectAngleHough(
-        sinogram_image, sinogram_template, th, tw)
-
-    # Step 5: 180度曖昧性の解消
-    _, _, score1 = detectPosition(sinogram_image, sinogram_template, detect_angle)
-    _, _, score2 = detectPosition(sinogram_image, sinogram_template, detect_angle + 180)
-
-    if score1 >= score2:
-        target_angle = detect_angle
-        dx, dy = hough_dx, hough_dy
-    else:
-        target_angle = detect_angle + 180
-        dx, dy = -hough_dx, -hough_dy
+    # Step 3: HFエネルギー最小化による姿勢検出
+    target_angle, dx, dy, hf_energy = detectByHFEnergy(
+        sinogram_image, template, img_h, img_w)
 
     print("detected: angle =", target_angle, ", dx =", dx, ", dy =", dy)
 
-    # Step 5: 可視化
+    # Step 4: 可視化
     plt.subplot(2, 3, 1)
     plt.imshow(template, cmap='gray')
     plt.title('Template')
     plt.colorbar()
 
     plt.subplot(2, 3, 2)
-    plt.plot(range(180), angle_scores)
-    plt.axvline(x=target_angle % 180, color='r', linestyle='--',
-                label=f'best={target_angle}')
-    plt.title('Hough Accumulator')
-    plt.xlabel('Angle shift (deg)')
-    plt.ylabel('Vote score')
-    plt.legend()
-
-    plt.subplot(2, 3, 3)
     plt.imshow(image, cmap='gray')
     plt.title('Target')
     plt.colorbar()
@@ -406,10 +539,10 @@ def matchTemplateRotatable(image, template):
     draw_color = (0, 0, 0)
     result_image = drawRotatedRectangleOnImage(
         image,
-        (dx + image.shape[1] // 2, dy + image.shape[0] // 2),
+        (dx + img_w // 2, dy + img_h // 2),
         tw, th, target_angle, draw_color)
 
-    plt.subplot(2, 3, 4)
+    plt.subplot(2, 3, 3)
     plt.imshow(result_image, cmap='gray')
     plt.title('Matched Image')
     plt.colorbar()
