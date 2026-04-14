@@ -100,76 +100,6 @@ def radonTransformFloat(image):
     return sinogram
 
 
-@jit(nopython=True, cache=True)
-def _radonLineInterp(image, angle_rad, line_length, perp_width):
-    """
-    バイリニア補間によるラドン変換の1行計算。
-    座標をfloatのまま保持し、int丸めによる角度依存の離散化誤差を排除する。
-    これにより R{f_rotated}(θ,t) = R{f}(θ-α,t) の性質が離散でも成立する。
-
-    :param image: 入力画像 (uint8, 2D)
-    :param angle_rad: 角度（ラジアン）
-    :param line_length: 直線の長さ
-    :param perp_width: 垂直方向の積分幅
-    :return: float64の投影プロファイル (line_length,)
-    """
-    h, w = image.shape
-    cx = w / 2.0
-    cy = h / 2.0
-    cos_a = math.cos(angle_rad)
-    sin_a = math.sin(angle_rad)
-
-    # 直線方向: (cos_a, -sin_a), 垂直方向: (sin_a, cos_a)
-    sums = np.zeros(line_length, dtype=np.float64)
-
-    for i in range(line_length):
-        t = (i - line_length / 2.0 + 0.5)
-        # 直線上の点（float座標）
-        lx = cx + t * cos_a
-        ly = cy - t * sin_a
-
-        total = 0.0
-        for j in range(-perp_width // 2, perp_width // 2):
-            # 垂直方向のサンプル点（float座標）
-            px = lx + j * sin_a
-            py = ly + j * cos_a
-
-            # バイリニア補間
-            if 0 <= px < w - 1 and 0 <= py < h - 1:
-                x0 = int(px)
-                y0 = int(py)
-                fx = px - x0
-                fy = py - y0
-                total += (image[y0, x0] * (1 - fx) * (1 - fy) +
-                          image[y0, x0 + 1] * fx * (1 - fy) +
-                          image[y0 + 1, x0] * (1 - fx) * fy +
-                          image[y0 + 1, x0 + 1] * fx * fy)
-            # 範囲外は0として扱う（corner_pixels_mean不使用）
-
-        sums[i] = total
-    return sums
-
-
-def radonTransformInterp(image):
-    """
-    バイリニア補間によるラドン変換。
-    角度間の離散化誤差が均一になり、行シフトによる回転表現が正確に成立する。
-
-    :param image: 入力画像 (uint8)
-    :return: float64サイノグラム (360 x line_length)
-    """
-    h, w = image.shape
-    line_length = int(math.sqrt(h * h + w * w))
-    perp_width = line_length
-
-    sinogram = np.zeros((360, line_length), dtype=np.float64)
-    for angle in range(360):
-        angle_rad = np.deg2rad(angle)
-        sinogram[angle, :] = _radonLineInterp(
-            image, angle_rad, line_length, perp_width)
-
-    return sinogram
-
 
 # =============================================================================
 # Angle Detection: Hough Voting / 角度検出：ハフ投票
@@ -368,217 +298,212 @@ def detectPosition(sinogram_image, sinogram_template, detect_angle, num_angles=3
 # HF Energy Refinement / 高周波エネルギー精密推定
 # =============================================================================
 
-def isTemplateInside(angle, dx, dy, tw, th, img_h, img_w, margin=2):
+def computeHFProfile(img_row, core, cutoff_ratio=1/8):
     """
-    回転後のテンプレートが画像内に完全に収まるか判定する。
+    FFTシフト定理で全位置のHFエネルギーを一括計算。
 
-    :param angle: 回転角度（度）
-    :param dx: x方向オフセット（画像中心基準）
-    :param dy: y方向オフセット（画像中心基準）
-    :param tw: テンプレート幅
-    :param th: テンプレート高さ
-    :param img_h: 画像の高さ
-    :param img_w: 画像の幅
-    :param margin: 境界マージン（ピクセル）
-    :return: True/False
+    画像行からコアを位置pで引いた残差のHFエネルギー:
+      E_HF(p) = const - (2/L)·Re(IFFT(A_HF · conj(B_HF))[p])
+
+    :param img_row: 画像サイノグラムの1行 (L,)
+    :param core: テンプレートサイノグラムのコア (nc,), nc < L
+    :param cutoff_ratio: ハイパスフィルタのカットオフ比率
+    :return: 各位置のHFエネルギー (L - nc + 1,)
     """
-    corners = np.array([[-tw / 2, -th / 2], [tw / 2, -th / 2],
-                        [tw / 2, th / 2], [-tw / 2, th / 2]])
-    rad = np.deg2rad(angle)
-    R = np.array([[np.cos(rad), -np.sin(rad)],
-                  [np.sin(rad), np.cos(rad)]])
-    rotated = corners @ R.T
-    abs_x = rotated[:, 0] + img_w / 2.0 + dx
-    abs_y = rotated[:, 1] + img_h / 2.0 + dy
-    return (abs_x.min() >= margin and abs_x.max() <= img_w - margin and
-            abs_y.min() >= margin and abs_y.max() <= img_h - margin)
+    L = len(img_row)
+    nc = len(core)
+    nr = L - nc + 1
+    if nr <= 0:
+        return np.full(L, np.inf)
+
+    core_padded = np.zeros(L, dtype=np.float64)
+    core_padded[:nc] = core.astype(np.float64)
+
+    A = np.fft.fft(img_row.astype(np.float64))
+    B = np.fft.fft(core_padded)
+
+    c = max(1, int(L * cutoff_ratio))
+    hf_mask = np.ones(L, dtype=np.float64)
+    hf_mask[:c] = 0
+    hf_mask[-c + 1:] = 0
+
+    A_hf = A * hf_mask
+    B_hf = B * hf_mask
+
+    const = np.sum(np.abs(A_hf) ** 2) / L + np.sum(np.abs(B_hf) ** 2) / L
+    cross_hf = A_hf * np.conj(B_hf)
+    cross_spatial = np.real(np.fft.ifft(cross_hf))
+    hf_energy = const - 2.0 / L * cross_spatial
+
+    return hf_energy[:nr]
 
 
-def highpassEnergy(sinogram, cutoff_ratio=1/8):
+def findPositionByHFProfile(sino_img, cores, alpha, n_img, center_t,
+                            cos_t, sin_t, max_dx, max_dy):
     """
-    サイノグラムの各行にハイパスフィルタを適用し、高周波エネルギーを計算。
+    角度αで全行のHFプロファイルを計算し、正弦波パスで最良(dx, dy)を推定。
 
-    :param sinogram: (360, L) サイノグラム
-    :param cutoff_ratio: 低周波カットオフ比率
-    :return: 高周波エネルギー（スカラー）
+    行の対応: image[i] ↔ template[(i + α) % 360]
+
+    :return: (best_dx, best_dy)
     """
-    sino = sinogram.astype(np.float64)
-    fft_all = np.fft.fft(sino, axis=1)
-    n = fft_all.shape[1]
-    cutoff = max(1, int(n * cutoff_ratio))
-    fft_all[:, :cutoff] = 0
-    fft_all[:, -cutoff + 1:] = 0
-    hf = np.real(np.fft.ifft(fft_all, axis=1))
-    return float(np.sum(hf ** 2))
+    # HFプロファイル事前計算
+    profiles = {}
+    for i in range(360):
+        j = (i + alpha) % 360
+        if j >= 180:
+            continue
+        core = cores[j]
+        if len(core) < 4 or len(core) >= n_img:
+            continue
+        prof = computeHFProfile(sino_img[i], core)
+        profiles[i] = (prof, len(core))
+
+    if len(profiles) == 0:
+        return 0, 0
+
+    # ベクトル化の準備
+    row_indices = sorted(profiles.keys())
+    prof_list = [profiles[i][0] for i in row_indices]
+    nc_list = np.array([profiles[i][1] for i in row_indices])
+    cos_vals = cos_t[row_indices]
+    sin_vals = sin_t[row_indices]
+    prof_lens = np.array([len(p) for p in prof_list])
+    n_rows = len(row_indices)
+
+    max_prof_len = max(prof_lens)
+    prof_matrix = np.full((n_rows, max_prof_len), np.inf, dtype=np.float64)
+    for k in range(n_rows):
+        prof_matrix[k, :prof_lens[k]] = prof_list[k]
+
+    def eval_positions_batch(dx_arr, dy_arr):
+        best_dx, best_dy, best_e = 0, 0, np.inf
+        for dx in dx_arr:
+            base_offsets = dx * cos_vals
+            for dy in dy_arr:
+                offsets = base_offsets - dy * sin_vals
+                positions = np.round(center_t + offsets - nc_list / 2.0).astype(int)
+                np.clip(positions, 0, prof_lens - 1, out=positions)
+                total = np.sum(prof_matrix[np.arange(n_rows), positions])
+                avg = total / n_rows
+                if avg < best_e:
+                    best_e = avg
+                    best_dx = dx
+                    best_dy = dy
+        return best_dx, best_dy, best_e
+
+    # 粗い位置探索 (step=2)
+    dx_range = np.arange(-max_dx, max_dx + 1, 2)
+    dy_range = np.arange(-max_dy, max_dy + 1, 2)
+    best_dx, best_dy, _ = eval_positions_batch(dx_range, dy_range)
+
+    # 精密探索 (step=1, ±2px)
+    dx_fine = np.arange(max(best_dx - 2, -max_dx), min(best_dx + 3, max_dx + 1))
+    dy_fine = np.arange(max(best_dy - 2, -max_dy), min(best_dy + 3, max_dy + 1))
+    fine_dx, fine_dy, _ = eval_positions_batch(dx_fine, dy_fine)
+
+    return fine_dx, fine_dy
 
 
-def makeTemplSinogram(template, angle, dx, dy, img_h, img_w):
+def refineByNCC(image, template, coarse_angle, coarse_dx, coarse_dy,
+                angle_range=3, pos_range=3):
     """
-    指定姿勢でテンプレートを画像サイズのキャンバスに配置し、サイノグラムを計算。
+    粗推定(α, dx, dy)の近傍で画像空間の2D NCCによる精密化。
 
-    :param template: テンプレート画像 (グレースケール)
-    :param angle: 回転角度（度）
-    :param dx: x方向オフセット（画像中心基準）
-    :param dy: y方向オフセット（画像中心基準）
-    :param img_h: ターゲット画像の高さ
-    :param img_w: ターゲット画像の幅
-    :return: (360, L) サイノグラム
+    :return: (angle, dx, dy, ncc_score)
     """
     th, tw = template.shape
-    M = cv2.getRotationMatrix2D((tw // 2, th // 2), -angle, 1.0)
-    tmpl_rot = cv2.warpAffine(template, M, (tw, th),
-                               borderMode=cv2.BORDER_REPLICATE)
-    canvas = np.zeros((img_h, img_w), dtype=np.uint8)
+    img_h, img_w = image.shape
     cy, cx = img_h // 2, img_w // 2
-    y1 = cy - th // 2 + dy
-    x1 = cx - tw // 2 + dx
-    canvas[y1:y1 + th, x1:x1 + tw] = tmpl_rot
-    return radonTransformFloat(canvas)
+
+    best_a = coarse_angle
+    best_dx = coarse_dx
+    best_dy = coarse_dy
+    best_score = -np.inf
+
+    for a in range(coarse_angle - angle_range, coarse_angle + angle_range + 1):
+        am = a % 360
+        M = cv2.getRotationMatrix2D((tw // 2, th // 2), -am, 1.0)
+        tmpl_rot = cv2.warpAffine(
+            template, M, (tw, th),
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        mask = cv2.warpAffine(
+            np.ones((th, tw), dtype=np.uint8) * 255,
+            M, (tw, th),
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        m = mask > 128
+        if np.sum(m) < 10:
+            continue
+        tmpl_masked = tmpl_rot.astype(np.float64)[m]
+        tm = tmpl_masked - tmpl_masked.mean()
+        tm_energy = np.sum(tm ** 2)
+        if tm_energy < 1e-10:
+            continue
+
+        for dx in range(coarse_dx - pos_range, coarse_dx + pos_range + 1):
+            for dy in range(coarse_dy - pos_range, coarse_dy + pos_range + 1):
+                y1 = cy - th // 2 + dy
+                x1 = cx - tw // 2 + dx
+                if y1 < 0 or y1 + th > img_h or x1 < 0 or x1 + tw > img_w:
+                    continue
+                region = image[y1:y1 + th, x1:x1 + tw].astype(np.float64)[m]
+                rm = region - region.mean()
+                denom = np.sqrt(np.sum(rm ** 2) * tm_energy)
+                if denom < 1e-10:
+                    continue
+                ncc = np.sum(rm * tm) / denom
+                if ncc > best_score:
+                    best_score = ncc
+                    best_a = am
+                    best_dx = dx
+                    best_dy = dy
+
+    return best_a, best_dx, best_dy, best_score
 
 
-def makeTemplSinogramCentered(template, angle, img_h, img_w):
+def detectByHFAndNCC(image, template, sinogram_image, cores, n_img,
+                     angle_step_coarse=3):
     """
-    回転テンプレートを画像中央に配置したサイノグラムを計算。
-    位置のオフセットは shiftSinogramPosition で後から適用する。
+    2段階テンプレートマッチング:
+      Step 1: 各角度αで行ごとHFプロファイル（FFTシフト定理）を
+              正弦波パスで集約し、(α, dx, dy) を粗推定
+      Step 2: 各候補の近傍で画像空間の2D NCCによる精密化
 
+    :param image: ターゲット画像 (グレースケール)
     :param template: テンプレート画像 (グレースケール)
-    :param angle: 回転角度（度）
-    :param img_h: ターゲット画像の高さ
-    :param img_w: ターゲット画像の幅
-    :return: (360, L) float32サイノグラム
+    :param sinogram_image: ターゲットのサイノグラム
+    :param cores: テンプレートのサイノグラムコア（extractSinogramCoreで取得）
+    :param n_img: サイノグラムの列数
+    :param angle_step_coarse: 角度粗探索のステップ（度）
+    :return: (angle, dx, dy, ncc_score)
     """
     th, tw = template.shape
-    M = cv2.getRotationMatrix2D((tw // 2, th // 2), -angle, 1.0)
-    tmpl_rot = cv2.warpAffine(template, M, (tw, th),
-                               borderMode=cv2.BORDER_REPLICATE)
-    canvas = np.zeros((img_h, img_w), dtype=np.uint8)
-    cy, cx = img_h // 2, img_w // 2
-    canvas[cy - th // 2:cy - th // 2 + th,
-           cx - tw // 2:cx - tw // 2 + tw] = tmpl_rot
-    return radonTransformFloat(canvas)
+    img_h, img_w = image.shape
 
-
-def shiftSinogramPosition(sinogram, dx, dy):
-    """
-    サイノグラムに平行移動 (dx, dy) を適用する。
-    各行θをt方向に offset = dx·cos(θ) - dy·sin(θ) だけシフト（線形補間）。
-
-    :param sinogram: (360, L) サイノグラム
-    :param dx: x方向オフセット（画像中心基準）
-    :param dy: y方向オフセット（画像中心基準）
-    :return: シフト済みサイノグラム (360, L)
-    """
-    n_angles, L = sinogram.shape
-    shifted = np.zeros((n_angles, L), dtype=np.float64)
-    t_indices = np.arange(L, dtype=np.float64)
-    for theta in range(n_angles):
-        theta_rad = np.deg2rad(theta)
-        offset = dx * np.cos(theta_rad) - dy * np.sin(theta_rad)
-        src = t_indices - offset
-        shifted[theta] = np.interp(src, t_indices, sinogram[theta].astype(np.float64),
-                                   left=0.0, right=0.0)
-    return shifted
-
-
-def detectByHFEnergy(sinogram_image, template, img_h, img_w,
-                     pos_step_coarse=2):
-    """
-    HFエネルギー最小化のみでテンプレートの姿勢 (angle, dx, dy) を検出する。
-    ハフ投票には依存しない。
-
-    最適化: 回転はラドン変換で計算（角度ごとに1回）、
-    平行移動はサイノグラムのシフト演算で高速に評価。
-
-    交互最適化による探索:
-      Phase 1: 角度全探索 0-359°（dx=0, dy=0 固定、各角度でラドン変換1回）
-      Phase 2: (dx, dy) 2Dスイープ（角度固定、シフト演算のみ）
-      Phase 3: 角度を再探索（正しい位置でシフト評価）
-      Phase 4: (dx, dy) を再探索（修正角度でシフト評価）
-      Phase 5: 局所精密探索
-
-    :param sinogram_image: ターゲット画像のサイノグラム
-    :param template: テンプレート画像（元画像）
-    :param img_h: ターゲット画像の高さ
-    :param img_w: ターゲット画像の幅
-    :param pos_step_coarse: Phase 2/4 の位置探索ステップ（ピクセル）
-    :return: (best_angle, best_dx, best_dy, best_hf_energy)
-    """
-    th, tw = template.shape
-    sino_img = sinogram_image.astype(np.float64)
-
-    # 位置探索範囲の算出（テンプレートが画像内に収まる最大範囲）
+    cos_t = np.cos(np.deg2rad(np.arange(360)))
+    sin_t = np.sin(np.deg2rad(np.arange(360)))
+    center_t = n_img // 2
     max_dx = (img_w - tw) // 2 - 2
     max_dy = (img_h - th) // 2 - 2
 
-    def eval_hf_with_shift(sino_centered, angle, dx, dy):
-        """中央配置サイノグラムを位置シフトしてHFエネルギーを計算"""
-        if not isTemplateInside(angle, dx, dy, tw, th, img_h, img_w):
-            return np.inf
-        sino_shifted = shiftSinogramPosition(sino_centered, dx, dy)
-        residual = sino_img - sino_shifted.astype(np.float64)
-        return highpassEnergy(residual)
+    # Step 1: 各角度で位置粗推定
+    candidates = []
+    for alpha in range(0, 360, angle_step_coarse):
+        dx_est, dy_est = findPositionByHFProfile(
+            sinogram_image, cores, alpha, n_img, center_t,
+            cos_t, sin_t, max_dx, max_dy)
+        candidates.append((alpha, dx_est, dy_est))
 
-    # 全角度の中央配置サイノグラムを事前計算（ラドン変換360回）
-    sino_per_angle = {}
+    # Step 2: 各候補の近傍で2D NCC精密化、最良を選択
+    best = (0, 0, 0, -np.inf)
+    for ca, cdx, cdy in candidates:
+        a, dx, dy, score = refineByNCC(
+            image, template, ca, cdx, cdy,
+            angle_range=angle_step_coarse, pos_range=3)
+        if score > best[3]:
+            best = (a, dx, dy, score)
 
-    def get_sino_centered(angle):
-        """角度ごとの中央配置サイノグラムを取得（キャッシュ付き）"""
-        if angle not in sino_per_angle:
-            sino_per_angle[angle] = makeTemplSinogramCentered(
-                template, angle, img_h, img_w)
-        return sino_per_angle[angle]
-
-    def sweep_angle(dx, dy):
-        """全角度 0-359° をスイープ（各角度のサイノグラムを位置シフト）"""
-        ba, be = 0, np.inf
-        for a in range(360):
-            sc = get_sino_centered(a)
-            e = eval_hf_with_shift(sc, a, dx, dy)
-            if e < be:
-                be = e
-                ba = a
-        return ba, be
-
-    def sweep_position(angle, step):
-        """(dx, dy) をシフト演算で2Dスイープ（ラドン変換なし）"""
-        sc = get_sino_centered(angle)
-        bd, bdy, be = 0, 0, np.inf
-        for dx in range(-max_dx, max_dx + 1, step):
-            for dy in range(-max_dy, max_dy + 1, step):
-                e = eval_hf_with_shift(sc, angle, dx, dy)
-                if e < be:
-                    be = e
-                    bd = dx
-                    bdy = dy
-        return bd, bdy, be
-
-    # Phase 1: 角度全探索（位置は中央固定）
-    best_a, best_e = sweep_angle(0, 0)
-
-    # Phase 2: 位置スイープ（シフト演算のみ、ラドン変換なし）
-    best_dx, best_dy, best_e = sweep_position(best_a, pos_step_coarse)
-
-    # Phase 3: 角度を再探索（正しい位置でシフト評価）
-    best_a, best_e = sweep_angle(best_dx, best_dy)
-
-    # Phase 4: 位置を再探索（修正された角度で）
-    best_dx, best_dy, best_e = sweep_position(best_a, pos_step_coarse)
-
-    # Phase 5: 局所精密探索（±3度, ±pos_step_coarseピクセル）
-    fine_a, fine_dx, fine_dy = best_a, best_dx, best_dy
-    for a in range(best_a - 3, best_a + 4):
-        a_mod = a % 360
-        sc = get_sino_centered(a_mod)
-        for dx in range(best_dx - pos_step_coarse, best_dx + pos_step_coarse + 1):
-            for dy in range(best_dy - pos_step_coarse, best_dy + pos_step_coarse + 1):
-                e = eval_hf_with_shift(sc, a_mod, dx, dy)
-                if e < best_e:
-                    best_e = e
-                    fine_a = a_mod
-                    fine_dx = dx
-                    fine_dy = dy
-
-    return fine_a, fine_dx, fine_dy, best_e
+    return best
 
 
 # =============================================================================
@@ -614,16 +539,15 @@ def drawRotatedRectangleOnImage(image, center, width, height, angle,
 
 def matchTemplateRotatable(image, template):
     """
-    残差サイノグラムのHFエネルギー最小化による回転不変テンプレートマッチング
+    ラドン変換の2段階テンプレートマッチング
 
     処理フロー:
       1. 適応的コントラスト正規化（コントラスト比 < 0.6 の場合）
-      2. ターゲット画像のサイノグラム計算
-      3. HFエネルギー最小化で姿勢 (angle, dx, dy) を検出
-         Phase 1: 角度全探索 0-359°
-         Phase 2: 位置2D探索
-         Phase 3: 局所精密探索
-      4. 結果の可視化
+      2. テンプレートにガウシアン窓を適用、サイノグラム+コア計算
+      3. Step 1: 行ごとHFプロファイル（FFTシフト定理）＋正弦波パス集約で
+         各角度αに対する(dx, dy)を粗推定
+      4. Step 2: 各候補の近傍で画像空間の2D NCCによる精密化
+      5. 結果の可視化
 
     :param image: 対象画像 (グレースケール)
     :param template: テンプレート画像 (グレースケール)
@@ -645,16 +569,31 @@ def matchTemplateRotatable(image, template):
     else:
         image_proc = image
 
-    # Step 2: ターゲット画像のサイノグラム計算
+    # Step 2: テンプレートのサイノグラム+コア計算
+    x = np.linspace(-1, 1, tw)
+    y = np.linspace(-1, 1, th)
+    x, y = np.meshgrid(x, y)
+    gw = np.exp(-(x**2 + y**2) / (2 * 1.0**2))
+    tmpl_windowed = (template.astype(np.float32) * gw).astype(np.uint8)
+
+    tmpl_canvas = cv2.copyMakeBorder(
+        tmpl_windowed,
+        (img_h - th) // 2, img_h - th - (img_h - th) // 2,
+        (img_w - tw) // 2, img_w - tw - (img_w - tw) // 2,
+        cv2.BORDER_CONSTANT, value=0)
     sinogram_image = radonTransformFloat(image_proc)
+    sinogram_template = radonTransformFloat(tmpl_canvas)
+    cores = extractSinogramCore(sinogram_template, th, tw)
+    n_img = sinogram_template.shape[1]
 
-    # Step 3: HFエネルギー最小化による姿勢検出
-    target_angle, dx, dy, hf_energy = detectByHFEnergy(
-        sinogram_image, template, img_h, img_w)
+    # Step 3-4: 2段階検出（HFプロファイル粗推定 + 2D NCC精密化）
+    target_angle, dx, dy, ncc_score = detectByHFAndNCC(
+        image_proc, template, sinogram_image, cores, n_img)
 
-    print("detected: angle =", target_angle, ", dx =", dx, ", dy =", dy)
+    print("detected: angle =", target_angle, ", dx =", dx, ", dy =", dy,
+          ", ncc =", f"{ncc_score:.4f}")
 
-    # Step 4: 可視化
+    # Step 5: 可視化
     plt.subplot(2, 3, 1)
     plt.imshow(template, cmap='gray')
     plt.title('Template')
