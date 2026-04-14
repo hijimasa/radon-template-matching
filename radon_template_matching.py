@@ -350,7 +350,7 @@ def findPositionByHFProfile(sino_img, cores, alpha, n_img, center_t,
     # HFプロファイル事前計算
     profiles = {}
     for i in range(360):
-        j = (i + alpha) % 360
+        j = (i - alpha) % 360
         if j >= 180:
             continue
         core = cores[j]
@@ -423,7 +423,7 @@ def refineByNCC(image, template, coarse_angle, coarse_dx, coarse_dy,
 
     for a in range(coarse_angle - angle_range, coarse_angle + angle_range + 1):
         am = a % 360
-        M = cv2.getRotationMatrix2D((tw // 2, th // 2), -am, 1.0)
+        M = cv2.getRotationMatrix2D((tw // 2, th // 2), am, 1.0)
         tmpl_rot = cv2.warpAffine(
             template, M, (tw, th),
             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
