@@ -339,7 +339,7 @@ def computeHFProfile(img_row, core, cutoff_ratio=1/8):
     return hf_energy[:nr]
 
 
-def precomputeNCCHFData(sinogram_image, cores, cutoff_ratio=1/8):
+def precomputeNCCHFData(sinogram_image, cores, cutoff_ratio=1/16):
     """
     NCC-HFプロファイル用の事前計算。
     HPF適用済み画像行のFFT・累積和と、HPF適用済みコアのFFT・統計量を計算する。
@@ -651,28 +651,35 @@ def findPositionByNCCHF(sino_img, cores, alpha, n_img, center_t,
 
     cos_vals = cos_t[valid_i]
     sin_vals = sin_t[valid_i]
+    half_nc = nc_arr / 2.0
+    prof_lens_clip = (prof_lens - 1).astype(np.intp)
 
-    def eval_positions_batch(dx_arr, dy_arr):
-        offsets = (dx_arr[:, None, None] * cos_vals[None, None, :]
-                   - dy_arr[None, :, None] * sin_vals[None, None, :])
-        positions = np.round(center_t + offsets - nc_arr[None, None, :] / 2.0).astype(np.intp)
-        np.clip(positions, 0, (prof_lens - 1)[None, None, :].astype(np.intp), out=positions)
-        row_idx = np.arange(n_rows)[None, None, :]
-        ncc_vals = prof_matrix[row_idx, positions]
-        totals = np.mean(ncc_vals, axis=2)
+    def eval_positions(dx_arr, dy_arr):
+        """行ループ方式: 2D配列を累積して巨大3D配列を回避"""
+        n_dx, n_dy = len(dx_arr), len(dy_arr)
+        totals = np.zeros((n_dx, n_dy), dtype=np.float64)
+        for k in range(n_rows):
+            offsets_k = dx_arr[:, None] * cos_vals[k] - dy_arr[None, :] * sin_vals[k]
+            p_k = np.round(center_t + offsets_k - half_nc[k]).astype(np.intp)
+            np.clip(p_k, 0, prof_lens_clip[k], out=p_k)
+            totals += prof_matrix[k, p_k]
+        totals /= n_rows
         max_flat = np.argmax(totals)
         di, dj = np.unravel_index(max_flat, totals.shape)
         return int(dx_arr[di]), int(dy_arr[dj]), totals[di, dj]
 
-    # 粗い位置探索 (step=2)
-    dx_range = np.arange(-max_dx, max_dx + 1, 2)
-    dy_range = np.arange(-max_dy, max_dy + 1, 2)
-    best_dx, best_dy, _ = eval_positions_batch(dx_range, dy_range)
+    # 3段階階層探索: step=4 → step=2(±4) → step=1(±2)
+    dx_range = np.arange(-max_dx, max_dx + 1, 4)
+    dy_range = np.arange(-max_dy, max_dy + 1, 4)
+    best_dx, best_dy, _ = eval_positions(dx_range, dy_range)
 
-    # 精密探索 (step=1, ±2px)
+    dx_mid = np.arange(max(best_dx - 4, -max_dx), min(best_dx + 5, max_dx + 1), 2)
+    dy_mid = np.arange(max(best_dy - 4, -max_dy), min(best_dy + 5, max_dy + 1), 2)
+    best_dx, best_dy, _ = eval_positions(dx_mid, dy_mid)
+
     dx_fine = np.arange(max(best_dx - 2, -max_dx), min(best_dx + 3, max_dx + 1))
     dy_fine = np.arange(max(best_dy - 2, -max_dy), min(best_dy + 3, max_dy + 1))
-    fine_dx, fine_dy, fine_score = eval_positions_batch(dx_fine, dy_fine)
+    fine_dx, fine_dy, fine_score = eval_positions(dx_fine, dy_fine)
 
     return fine_dx, fine_dy, fine_score
 
@@ -796,6 +803,68 @@ def detectByHFAndNCC(image, template, sinogram_image, cores, n_img,
     return best
 
 
+def detectByNCCHF(sinogram_image, cores, n_img,
+                  template_height, template_width,
+                  img_height, img_width, angle_step_coarse=3,
+                  verbose=True):
+    """
+    NCC-HF版テンプレートマッチング。
+    HPFバンドでのローカルNCC最大化により、サイノグラム空間のみで
+    角度・位置を同時検出する。NCC精密化ステップ不要。
+
+    :return: (angle, dx, dy, ncc_hf_score)
+    """
+    cos_t = np.cos(np.deg2rad(np.arange(360)))
+    sin_t = np.sin(np.deg2rad(np.arange(360)))
+    center_t = n_img // 2
+    max_dx = (img_width - template_width) // 2 - 2
+    max_dy = (img_height - template_height) // 2 - 2
+
+    # NCC-HF事前計算
+    t0 = time.time()
+    ncc_data = precomputeNCCHFData(sinogram_image, cores)
+    if verbose:
+        print(f"  NCC-HF precompute: {time.time() - t0:.3f}s")
+
+    # Step 1: 粗い角度探索 (step=angle_step_coarse)
+    t0 = time.time()
+    candidates = []
+    for alpha in range(0, 360, angle_step_coarse):
+        dx, dy, score = findPositionByNCCHF(
+            sinogram_image, cores, alpha, n_img, center_t,
+            cos_t, sin_t, max_dx, max_dy, ncc_data=ncc_data)
+        candidates.append((alpha, dx, dy, score))
+    n_coarse = len(candidates)
+    t1 = time.time() - t0
+    if verbose:
+        print(f"  Coarse search: {t1:.3f}s ({n_coarse} angles, step={angle_step_coarse})")
+
+    # 上位K候補の近傍で1°刻み精密化
+    top_k = 5
+    candidates.sort(key=lambda c: -c[3])
+    top_candidates = candidates[:top_k]
+
+    t0 = time.time()
+    best = (0, 0, 0, -np.inf)
+    for ca, cdx, cdy, cscore in top_candidates:
+        if cscore > best[3]:
+            best = (ca, cdx, cdy, cscore)
+        for da in range(-angle_step_coarse, angle_step_coarse + 1):
+            alpha = (ca + da) % 360
+            if alpha % angle_step_coarse == 0:
+                continue
+            dx, dy, score = findPositionByNCCHF(
+                sinogram_image, cores, alpha, n_img, center_t,
+                cos_t, sin_t, max_dx, max_dy, ncc_data=ncc_data)
+            if score > best[3]:
+                best = (alpha, dx, dy, score)
+    t2 = time.time() - t0
+    if verbose:
+        print(f"  Fine search: {t2:.3f}s (top {top_k} ± {angle_step_coarse}°)")
+
+    return best
+
+
 # =============================================================================
 # Drawing / 描画
 # =============================================================================
@@ -883,16 +952,16 @@ def matchTemplateRotatable(image, template):
     cores = extractSinogramCore(sinogram_template, th, tw)
     n_img = sinogram_template.shape[1]
 
-    # Step 3-4: 2段階検出（HFプロファイル粗推定 + 2D NCC精密化）
+    # NCC-HF検出（サイノグラム空間のみ、画像空間NCC不要）
     t_detect = time.time()
-    target_angle, dx, dy, ncc_score = detectByHFAndNCC(
-        image_proc, template, sinogram_image, cores, n_img)
+    target_angle, dx, dy, ncc_hf_score = detectByNCCHF(
+        sinogram_image, cores, n_img, th, tw, img_h, img_w)
     t_detect = time.time() - t_detect
 
     print(f"Detection total: {t_detect:.3f}s")
     print(f"Overall: {time.time() - t_start:.3f}s")
     print("detected: angle =", target_angle, ", dx =", dx, ", dy =", dy,
-          ", ncc =", f"{ncc_score:.4f}")
+          ", ncc_hf =", f"{ncc_hf_score:.6f}")
 
     # Step 5: 可視化
     plt.subplot(2, 3, 1)

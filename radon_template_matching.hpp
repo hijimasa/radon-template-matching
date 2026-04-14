@@ -79,4 +79,46 @@ DetectionResult detectByHFAndNCC(const cv::Mat &image,
                                   int n_img,
                                   int angle_step_coarse = 3);
 
+// =====================================================================
+// NCC-HF detection (sinogram-space only, no image-space NCC needed)
+// =====================================================================
+
+// Precomputed data for NCC-HF detection
+struct NCCHFData {
+    int L;                                     // sinogram row length
+    std::vector<cv::Mat> img_hf_fft;           // HPF'd image row FFTs (360 x L, complex)
+    std::vector<std::vector<double>> img_cumsum;     // cumsum of HPF'd rows (360 x L+1)
+    std::vector<std::vector<double>> img_cumsum_sq;  // cumsum of squared HPF'd rows
+    std::vector<cv::Mat> core_hf_fft;          // HPF'd core FFTs padded to L (180, complex)
+    std::vector<double> core_hf_mean;          // mean of HPF'd core (180)
+    std::vector<double> core_hf_energy;        // Σ(core_hf - mean)² (180)
+    std::vector<int> nc_list;                  // core lengths (180)
+    std::vector<bool> valid;                   // whether core j is usable (180)
+};
+
+// Precompute FFTs, running sums, and core stats for NCC-HF
+NCCHFData precomputeNCCHFData(const cv::Mat &sinogram_image,
+                               const std::vector<cv::Mat> &cores,
+                               double cutoff_ratio = 1.0 / 16);
+
+// Find best (dx, dy) for a given angle using NCC-HF profiles
+struct NCCHFResult {
+    int dx, dy;
+    double score;
+};
+
+NCCHFResult findPositionByNCCHF(const NCCHFData &data,
+                                 int alpha, int center_t,
+                                 const std::vector<double> &cos_t,
+                                 const std::vector<double> &sin_t,
+                                 int max_dx, int max_dy);
+
+// Full NCC-HF detection: coarse angle search + fine refinement
+DetectionResult detectByNCCHF(const cv::Mat &sinogram_image,
+                               const std::vector<cv::Mat> &cores,
+                               int n_img,
+                               int template_height, int template_width,
+                               int img_height, int img_width,
+                               int angle_step_coarse = 3);
+
 #endif // RADON_TEMPLATE_MATCHING_HPP

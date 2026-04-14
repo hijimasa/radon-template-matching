@@ -551,3 +551,314 @@ DetectionResult detectByHFAndNCC(const cv::Mat &image, const cv::Mat &templ,
 
     return best;
 }
+
+// =============================================================================
+// NCC-HF detection (sinogram-space only)
+// =============================================================================
+
+NCCHFData precomputeNCCHFData(const cv::Mat &sinogram_image,
+                               const std::vector<cv::Mat> &cores,
+                               double cutoff_ratio) {
+    NCCHFData data;
+    int L = sinogram_image.cols;
+    data.L = L;
+    int c_L = std::max(1, (int)(L * cutoff_ratio));
+
+    // HPマスク (全行共通)
+    cv::Mat hf_mask = cv::Mat::ones(1, L, CV_64F);
+    for (int k = 0; k < c_L; k++)
+        hf_mask.at<double>(0, k) = 0;
+    for (int k = L - c_L + 1; k < L; k++)
+        hf_mask.at<double>(0, k) = 0;
+
+    // 画像行: HPF → FFT保持, 累積和
+    data.img_hf_fft.resize(360);
+    data.img_cumsum.resize(360);
+    data.img_cumsum_sq.resize(360);
+
+    for (int i = 0; i < 360; i++) {
+        cv::Mat row_f;
+        sinogram_image.row(i).convertTo(row_f, CV_64F);
+        cv::Mat F;
+        cv::dft(row_f, F, cv::DFT_COMPLEX_OUTPUT);
+
+        // HPF適用
+        for (int k = 0; k < L; k++) {
+            double m = hf_mask.at<double>(0, k);
+            F.at<cv::Vec2d>(0, k)[0] *= m;
+            F.at<cv::Vec2d>(0, k)[1] *= m;
+        }
+        data.img_hf_fft[i] = F.clone();
+
+        // IFFT → 実部を取得して累積和
+        cv::Mat row_hf;
+        cv::dft(F, row_hf, cv::DFT_INVERSE | cv::DFT_SCALE);
+        data.img_cumsum[i].resize(L + 1, 0);
+        data.img_cumsum_sq[i].resize(L + 1, 0);
+        for (int t = 0; t < L; t++) {
+            double v = row_hf.at<cv::Vec2d>(0, t)[0];
+            data.img_cumsum[i][t + 1] = data.img_cumsum[i][t] + v;
+            data.img_cumsum_sq[i][t + 1] = data.img_cumsum_sq[i][t] + v * v;
+        }
+    }
+
+    // コア: HPF (コア長基準) → ゼロパディングしてFFT, 平均・分散
+    data.core_hf_fft.resize(180);
+    data.core_hf_mean.resize(180, 0);
+    data.core_hf_energy.resize(180, 0);
+    data.nc_list.resize(180, 0);
+    data.valid.resize(180, false);
+
+    for (int j = 0; j < 180; j++) {
+        int nc = cores[j].cols;
+        data.nc_list[j] = nc;
+        if (nc < 4 || nc >= L) continue;
+
+        // HPFコア (コア長基準のカットオフ)
+        int c_nc = std::max(1, (int)(nc * cutoff_ratio));
+        cv::Mat core_f;
+        cores[j].convertTo(core_f, CV_64F);
+        cv::Mat Fc;
+        cv::dft(core_f, Fc, cv::DFT_COMPLEX_OUTPUT);
+        for (int k = 0; k < c_nc; k++) {
+            Fc.at<cv::Vec2d>(0, k) = {0, 0};
+        }
+        for (int k = nc - c_nc + 1; k < nc; k++) {
+            Fc.at<cv::Vec2d>(0, k) = {0, 0};
+        }
+        // 逆変換して統計量
+        cv::Mat core_hf;
+        cv::dft(Fc, core_hf, cv::DFT_INVERSE | cv::DFT_SCALE);
+        double sum = 0;
+        std::vector<double> core_vals(nc);
+        for (int t = 0; t < nc; t++) {
+            core_vals[t] = core_hf.at<cv::Vec2d>(0, t)[0];
+            sum += core_vals[t];
+        }
+        double mean = sum / nc;
+        data.core_hf_mean[j] = mean;
+        double energy = 0;
+        for (int t = 0; t < nc; t++) {
+            double d = core_vals[t] - mean;
+            energy += d * d;
+        }
+        data.core_hf_energy[j] = energy;
+
+        // L長にゼロパディングしてFFT (相互相関用)
+        cv::Mat padded = cv::Mat::zeros(1, L, CV_64F);
+        for (int t = 0; t < nc; t++)
+            padded.at<double>(0, t) = core_vals[t];
+        cv::Mat Fp;
+        cv::dft(padded, Fp, cv::DFT_COMPLEX_OUTPUT);
+        data.core_hf_fft[j] = Fp.clone();
+        data.valid[j] = true;
+    }
+
+    return data;
+}
+
+
+NCCHFResult findPositionByNCCHF(const NCCHFData &data,
+                                 int alpha, int center_t,
+                                 const std::vector<double> &cos_t,
+                                 const std::vector<double> &sin_t,
+                                 int max_dx, int max_dy) {
+    int L = data.L;
+
+    // 有効な(i, j)ペア収集
+    std::vector<int> valid_i, valid_j;
+    for (int i = 0; i < 360; i++) {
+        int j = ((i - alpha) % 360 + 360) % 360;
+        if (j >= 180) continue;
+        if (!data.valid[j]) continue;
+        int nc = data.nc_list[j];
+        if (L - nc + 1 <= 0) continue;
+        valid_i.push_back(i);
+        valid_j.push_back(j);
+    }
+
+    int n_rows = (int)valid_i.size();
+    if (n_rows == 0) return {0, 0, -1e30};
+
+    // nc, prof_lens, cos/sin 配列
+    std::vector<int> nc_arr(n_rows), prof_lens(n_rows);
+    std::vector<double> cos_vals(n_rows), sin_vals(n_rows), half_nc(n_rows);
+    for (int k = 0; k < n_rows; k++) {
+        nc_arr[k] = data.nc_list[valid_j[k]];
+        prof_lens[k] = L - nc_arr[k] + 1;
+        cos_vals[k] = cos_t[valid_i[k]];
+        sin_vals[k] = sin_t[valid_i[k]];
+        half_nc[k] = nc_arr[k] / 2.0;
+    }
+
+    // バッチ相互相関: IFFT(A * conj(B))
+    // 行ごとにcross_spatial[k] を計算
+    std::vector<std::vector<double>> cross_spatial(n_rows, std::vector<double>(L));
+    for (int k = 0; k < n_rows; k++) {
+        int i = valid_i[k], j = valid_j[k];
+        cv::Mat cross_f(1, L, CV_64FC2);
+        const cv::Mat &A = data.img_hf_fft[i];
+        const cv::Mat &B = data.core_hf_fft[j];
+        for (int f = 0; f < L; f++) {
+            auto a = A.at<cv::Vec2d>(0, f);
+            auto b = B.at<cv::Vec2d>(0, f);
+            cross_f.at<cv::Vec2d>(0, f) = {
+                a[0]*b[0] + a[1]*b[1],   // Re(A * conj(B))
+                a[1]*b[0] - a[0]*b[1]    // Im(A * conj(B))
+            };
+        }
+        cv::Mat cross_t;
+        cv::dft(cross_f, cross_t, cv::DFT_INVERSE | cv::DFT_SCALE);
+        for (int t = 0; t < L; t++)
+            cross_spatial[k][t] = cross_t.at<cv::Vec2d>(0, t)[0];
+    }
+
+    // NCCプロファイル構築
+    int max_prof_len = 0;
+    for (int k = 0; k < n_rows; k++)
+        max_prof_len = std::max(max_prof_len, prof_lens[k]);
+
+    std::vector<std::vector<double>> prof_matrix(n_rows, std::vector<double>(max_prof_len, -1e30));
+
+    for (int k = 0; k < n_rows; k++) {
+        int i_idx = valid_i[k];
+        int nc = nc_arr[k];
+        int nr = prof_lens[k];
+        double c_mean = data.core_hf_mean[valid_j[k]];
+        double c_energy = data.core_hf_energy[valid_j[k]];
+        const auto &cs = data.img_cumsum[i_idx];
+        const auto &css = data.img_cumsum_sq[i_idx];
+
+        for (int p = 0; p < nr; p++) {
+            double local_sum = cs[p + nc] - cs[p];
+            double local_sum_sq = css[p + nc] - css[p];
+            double local_mean = local_sum / nc;
+            double local_var = local_sum_sq / nc - local_mean * local_mean;
+            if (local_var < 0) local_var = 0;
+            double denom = std::sqrt(local_var * c_energy);
+            if (denom < 1e-10) {
+                prof_matrix[k][p] = 0;
+            } else {
+                double num = cross_spatial[k][p] / nc - local_mean * c_mean;
+                prof_matrix[k][p] = num / denom;
+            }
+        }
+    }
+
+    // 位置探索 (行ループ方式 + 3段階階層)
+    auto eval_positions = [&](const std::vector<int> &dx_arr,
+                               const std::vector<int> &dy_arr,
+                               int &best_dx, int &best_dy, double &best_score) {
+        int n_dx = (int)dx_arr.size(), n_dy = (int)dy_arr.size();
+        std::vector<double> totals(n_dx * n_dy, 0);
+
+        for (int k = 0; k < n_rows; k++) {
+            double ck = cos_vals[k], sk = sin_vals[k], hk = half_nc[k];
+            int pl = prof_lens[k] - 1;
+            for (int di = 0; di < n_dx; di++) {
+                double base = center_t + dx_arr[di] * ck - hk;
+                for (int dj = 0; dj < n_dy; dj++) {
+                    int p = (int)std::round(base - dy_arr[dj] * sk);
+                    p = std::clamp(p, 0, pl);
+                    totals[di * n_dy + dj] += prof_matrix[k][p];
+                }
+            }
+        }
+
+        best_score = -1e30;
+        for (int di = 0; di < n_dx; di++) {
+            for (int dj = 0; dj < n_dy; dj++) {
+                double avg = totals[di * n_dy + dj] / n_rows;
+                if (avg > best_score) {
+                    best_score = avg;
+                    best_dx = dx_arr[di];
+                    best_dy = dy_arr[dj];
+                }
+            }
+        }
+    };
+
+    auto make_range = [](int lo, int hi, int step) {
+        std::vector<int> v;
+        for (int x = lo; x <= hi; x += step) v.push_back(x);
+        return v;
+    };
+
+    int best_dx = 0, best_dy = 0;
+    double best_score = -1e30;
+
+    // Step 1: step=4
+    eval_positions(make_range(-max_dx, max_dx, 4),
+                   make_range(-max_dy, max_dy, 4),
+                   best_dx, best_dy, best_score);
+
+    // Step 2: step=2, ±4
+    eval_positions(make_range(std::max(best_dx-4, -max_dx), std::min(best_dx+4, max_dx), 2),
+                   make_range(std::max(best_dy-4, -max_dy), std::min(best_dy+4, max_dy), 2),
+                   best_dx, best_dy, best_score);
+
+    // Step 3: step=1, ±2
+    eval_positions(make_range(std::max(best_dx-2, -max_dx), std::min(best_dx+2, max_dx), 1),
+                   make_range(std::max(best_dy-2, -max_dy), std::min(best_dy+2, max_dy), 1),
+                   best_dx, best_dy, best_score);
+
+    return {best_dx, best_dy, best_score};
+}
+
+
+DetectionResult detectByNCCHF(const cv::Mat &sinogram_image,
+                               const std::vector<cv::Mat> &cores,
+                               int n_img,
+                               int template_height, int template_width,
+                               int img_height, int img_width,
+                               int angle_step_coarse) {
+    int center_t = n_img / 2;
+    int max_dx = (img_width - template_width) / 2 - 2;
+    int max_dy = (img_height - template_height) / 2 - 2;
+
+    std::vector<double> cos_t(360), sin_t(360);
+    for (int i = 0; i < 360; i++) {
+        double rad = i * CV_PI / 180.0;
+        cos_t[i] = std::cos(rad);
+        sin_t[i] = std::sin(rad);
+    }
+
+    // 事前計算
+    NCCHFData data = precomputeNCCHFData(sinogram_image, cores);
+
+    // Step 1: 粗い角度探索 (step=angle_step_coarse)
+    struct Candidate { int alpha, dx, dy; double score; };
+    std::vector<Candidate> candidates;
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int alpha = 0; alpha < 360; alpha += angle_step_coarse) {
+        auto r = findPositionByNCCHF(data, alpha, center_t,
+                                      cos_t, sin_t, max_dx, max_dy);
+        #pragma omp critical
+        candidates.push_back({alpha, r.dx, r.dy, r.score});
+    }
+
+    // スコア順ソート
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate &a, const Candidate &b) { return a.score > b.score; });
+
+    // Step 2: 上位K候補の近傍で1°刻み精密化
+    int top_k = std::min(5, (int)candidates.size());
+    DetectionResult best = {0, 0, 0, -1e30};
+
+    for (int ci = 0; ci < top_k; ci++) {
+        const auto &c = candidates[ci];
+        if (c.score > best.score)
+            best = {c.alpha, c.dx, c.dy, c.score};
+        for (int da = -angle_step_coarse; da <= angle_step_coarse; da++) {
+            int alpha = ((c.alpha + da) % 360 + 360) % 360;
+            if (alpha % angle_step_coarse == 0) continue;
+            auto r = findPositionByNCCHF(data, alpha, center_t,
+                                          cos_t, sin_t, max_dx, max_dy);
+            if (r.score > best.score)
+                best = {alpha, r.dx, r.dy, r.score};
+        }
+    }
+
+    return best;
+}
