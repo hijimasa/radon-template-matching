@@ -4,6 +4,8 @@
 
 Rotation-invariant template matching via NCC-HF (Normalized Cross-Correlation in High-pass Filtered sinogram space)
 
+![実行結果](./figs/result.png)
+
 ## Algorithm / アルゴリズム
 
 ### NCC-HF: サイノグラム空間のローカル正規化相関
