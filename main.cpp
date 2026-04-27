@@ -94,16 +94,13 @@ int main() {
 
         // Prepare sinogram and cores
         Mat templ_windowed = applyGaussianWindow(templ, 1.0);
-        int pad_top = (fh - th) / 2, pad_bottom = fh - th - pad_top;
-        int pad_left = (fw - tw) / 2, pad_right = fw - tw - pad_left;
-        Mat tmpl_canvas;
-        copyMakeBorder(templ_windowed, tmpl_canvas,
-                       pad_top, pad_bottom, pad_left, pad_right,
-                       BORDER_CONSTANT, Scalar(0));
+        // 1px zero pad: ensures corner_mean=0 in radon (windowed border ≠ 0 otherwise)
+        Mat templ_padded;
+        copyMakeBorder(templ_windowed, templ_padded, 1, 1, 1, 1, BORDER_CONSTANT, Scalar(0));
         Mat sino_img = radonTransformFloat(image);
-        Mat sino_tmpl = radonTransformFloat(tmpl_canvas);
+        Mat sino_tmpl = radonTransformFloat(templ_padded);
         auto cores = extractSinogramCore(sino_tmpl, th, tw);
-        int n_img = sino_tmpl.cols;
+        int n_img = sino_img.cols;
 
         auto t_prep = chrono::high_resolution_clock::now();
         double ms_prep = chrono::duration<double, milli>(t_prep - t0).count();
@@ -135,20 +132,12 @@ int main() {
         auto t0 = chrono::high_resolution_clock::now();
 
         Mat templ_windowed = applyGaussianWindow(templ, 1.0);
-        int pad_top = (fh - th) / 2, pad_bottom = fh - th - pad_top;
-        int pad_left = (fw - tw) / 2, pad_right = fw - tw - pad_left;
-
-        // corner_pixels_mean of image for canvas fill
-        double cm = (mean(image.row(0))[0] + mean(image.row(fh-1))[0] +
-                     mean(image.col(0))[0] + mean(image.col(fw-1))[0]) / 4.0;
-        Mat tmpl_canvas;
-        copyMakeBorder(templ_windowed, tmpl_canvas,
-                       pad_top, pad_bottom, pad_left, pad_right,
-                       BORDER_CONSTANT, Scalar(cm));
+        Mat templ_padded;
+        copyMakeBorder(templ_windowed, templ_padded, 1, 1, 1, 1, BORDER_CONSTANT, Scalar(0));
         Mat sino_img = radonTransformFloat(image);
-        Mat sino_tmpl = radonTransformFloat(tmpl_canvas);
+        Mat sino_tmpl = radonTransformFloat(templ_padded);
         auto cores = extractSinogramCore(sino_tmpl, th, tw);
-        int n_img = sino_tmpl.cols;
+        int n_img = sino_img.cols;
 
         auto t_prep = chrono::high_resolution_clock::now();
         double ms_prep = chrono::duration<double, milli>(t_prep - t0).count();
@@ -201,15 +190,10 @@ int main() {
             // NCC-HF
             t0 = chrono::high_resolution_clock::now();
             Mat tw_nat = applyGaussianWindow(nat_tmpl, 1.0);
-            double cm2 = (mean(nat_img.row(0))[0] + mean(nat_img.row(nih-1))[0] +
-                          mean(nat_img.col(0))[0] + mean(nat_img.col(niw-1))[0]) / 4.0;
-            Mat canvas2;
-            copyMakeBorder(tw_nat, canvas2,
-                           (nih-nth)/2, nih-nth-(nih-nth)/2,
-                           (niw-ntw)/2, niw-ntw-(niw-ntw)/2,
-                           BORDER_CONSTANT, Scalar(cm2));
+            Mat tw_nat_padded;
+            copyMakeBorder(tw_nat, tw_nat_padded, 1, 1, 1, 1, BORDER_CONSTANT, Scalar(0));
             Mat si2 = radonTransformFloat(nat_img);
-            Mat st2 = radonTransformFloat(canvas2);
+            Mat st2 = radonTransformFloat(tw_nat_padded);
             auto cores2 = extractSinogramCore(st2, nth, ntw);
             auto r2 = detectByNCCHF(si2, cores2, si2.cols, nth, ntw, nih, niw);
             t1 = chrono::high_resolution_clock::now();

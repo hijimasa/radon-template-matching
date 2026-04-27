@@ -561,48 +561,57 @@ NCCHFData precomputeNCCHFData(const cv::Mat &sinogram_image,
                                double cutoff_ratio) {
     NCCHFData data;
     int L = sinogram_image.cols;
+    int L_fft = cv::getOptimalDFTSize(L);
     data.L = L;
+    data.L_fft = L_fft;
     int c_L = std::max(1, (int)(L * cutoff_ratio));
 
-    // HPマスク (全行共通)
+    // HPF mask at original L (precise filtering)
     cv::Mat hf_mask = cv::Mat::ones(1, L, CV_64F);
     for (int k = 0; k < c_L; k++)
         hf_mask.at<double>(0, k) = 0;
     for (int k = L - c_L + 1; k < L; k++)
         hf_mask.at<double>(0, k) = 0;
 
-    // 画像行: HPF → FFT保持, 累積和
+    // Image rows: HPF at L (precise) → cumsum at L → zero-pad to L_fft → FFT (fast)
     data.img_hf_fft.resize(360);
     data.img_cumsum.resize(360);
     data.img_cumsum_sq.resize(360);
 
     for (int i = 0; i < 360; i++) {
+        // Step 1: precise HPF at L
         cv::Mat row_f;
         sinogram_image.row(i).convertTo(row_f, CV_64F);
-        cv::Mat F;
-        cv::dft(row_f, F, cv::DFT_COMPLEX_OUTPUT);
-
-        // HPF適用
+        cv::Mat F_L;
+        cv::dft(row_f, F_L, cv::DFT_COMPLEX_OUTPUT);
         for (int k = 0; k < L; k++) {
             double m = hf_mask.at<double>(0, k);
-            F.at<cv::Vec2d>(0, k)[0] *= m;
-            F.at<cv::Vec2d>(0, k)[1] *= m;
+            F_L.at<cv::Vec2d>(0, k)[0] *= m;
+            F_L.at<cv::Vec2d>(0, k)[1] *= m;
         }
-        data.img_hf_fft[i] = F.clone();
-
-        // IFFT → 実部を取得して累積和
         cv::Mat row_hf;
-        cv::dft(F, row_hf, cv::DFT_INVERSE | cv::DFT_SCALE);
+        cv::dft(F_L, row_hf, cv::DFT_INVERSE | cv::DFT_SCALE);
+
         data.img_cumsum[i].resize(L + 1, 0);
         data.img_cumsum_sq[i].resize(L + 1, 0);
+        std::vector<double> hf_vals(L);
         for (int t = 0; t < L; t++) {
             double v = row_hf.at<cv::Vec2d>(0, t)[0];
+            hf_vals[t] = v;
             data.img_cumsum[i][t + 1] = data.img_cumsum[i][t] + v;
             data.img_cumsum_sq[i][t + 1] = data.img_cumsum_sq[i][t] + v * v;
         }
+
+        // Step 2: zero-pad HPF'd signal to L_fft and FFT (for fast cross-correlation)
+        cv::Mat hf_padded = cv::Mat::zeros(1, L_fft, CV_64F);
+        for (int t = 0; t < L; t++)
+            hf_padded.at<double>(0, t) = hf_vals[t];
+        cv::Mat F_opt;
+        cv::dft(hf_padded, F_opt, cv::DFT_COMPLEX_OUTPUT);
+        data.img_hf_fft[i] = F_opt.clone();
     }
 
-    // コア: HPF (コア長基準) → ゼロパディングしてFFT, 平均・分散
+    // Cores: HPF at nc (precise) → mean/energy at nc → zero-pad to L_fft → FFT
     data.core_hf_fft.resize(180);
     data.core_hf_mean.resize(180, 0);
     data.core_hf_energy.resize(180, 0);
@@ -614,7 +623,7 @@ NCCHFData precomputeNCCHFData(const cv::Mat &sinogram_image,
         data.nc_list[j] = nc;
         if (nc < 4 || nc >= L) continue;
 
-        // HPFコア (コア長基準のカットオフ)
+        // Step 1: precise HPF at nc
         int c_nc = std::max(1, (int)(nc * cutoff_ratio));
         cv::Mat core_f;
         cores[j].convertTo(core_f, CV_64F);
@@ -626,7 +635,6 @@ NCCHFData precomputeNCCHFData(const cv::Mat &sinogram_image,
         for (int k = nc - c_nc + 1; k < nc; k++) {
             Fc.at<cv::Vec2d>(0, k) = {0, 0};
         }
-        // 逆変換して統計量
         cv::Mat core_hf;
         cv::dft(Fc, core_hf, cv::DFT_INVERSE | cv::DFT_SCALE);
         double sum = 0;
@@ -644,8 +652,8 @@ NCCHFData precomputeNCCHFData(const cv::Mat &sinogram_image,
         }
         data.core_hf_energy[j] = energy;
 
-        // L長にゼロパディングしてFFT (相互相関用)
-        cv::Mat padded = cv::Mat::zeros(1, L, CV_64F);
+        // Step 2: zero-pad HPF'd core to L_fft and FFT (for fast cross-correlation)
+        cv::Mat padded = cv::Mat::zeros(1, L_fft, CV_64F);
         for (int t = 0; t < nc; t++)
             padded.at<double>(0, t) = core_vals[t];
         cv::Mat Fp;
@@ -691,15 +699,15 @@ NCCHFResult findPositionByNCCHF(const NCCHFData &data,
         half_nc[k] = nc_arr[k] / 2.0;
     }
 
-    // バッチ相互相関: IFFT(A * conj(B))
-    // 行ごとにcross_spatial[k] を計算
+    // バッチ相互相関: IFFT(A * conj(B)) を L_fft 長で実行
+    int L_fft = data.L_fft > 0 ? data.L_fft : L;  // 後方互換
     std::vector<std::vector<double>> cross_spatial(n_rows, std::vector<double>(L));
     for (int k = 0; k < n_rows; k++) {
         int i = valid_i[k], j = valid_j[k];
-        cv::Mat cross_f(1, L, CV_64FC2);
+        cv::Mat cross_f(1, L_fft, CV_64FC2);
         const cv::Mat &A = data.img_hf_fft[i];
         const cv::Mat &B = data.core_hf_fft[j];
-        for (int f = 0; f < L; f++) {
+        for (int f = 0; f < L_fft; f++) {
             auto a = A.at<cv::Vec2d>(0, f);
             auto b = B.at<cv::Vec2d>(0, f);
             cross_f.at<cv::Vec2d>(0, f) = {

@@ -85,11 +85,12 @@ DetectionResult detectByHFAndNCC(const cv::Mat &image,
 
 // Precomputed data for NCC-HF detection
 struct NCCHFData {
-    int L;                                     // sinogram row length
-    std::vector<cv::Mat> img_hf_fft;           // HPF'd image row FFTs (360 x L, complex)
+    int L;                                     // sinogram row length (cumsum / HPF reference)
+    int L_fft;                                 // FFT length (= getOptimalDFTSize(L), ≥ L)
+    std::vector<cv::Mat> img_hf_fft;           // HPF'd image row FFTs (360 x L_fft, complex)
     std::vector<std::vector<double>> img_cumsum;     // cumsum of HPF'd rows (360 x L+1)
     std::vector<std::vector<double>> img_cumsum_sq;  // cumsum of squared HPF'd rows
-    std::vector<cv::Mat> core_hf_fft;          // HPF'd core FFTs padded to L (180, complex)
+    std::vector<cv::Mat> core_hf_fft;          // HPF'd core FFTs padded to L_fft (180, complex)
     std::vector<double> core_hf_mean;          // mean of HPF'd core (180)
     std::vector<double> core_hf_energy;        // Σ(core_hf - mean)² (180)
     std::vector<int> nc_list;                  // core lengths (180)
