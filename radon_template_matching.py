@@ -342,27 +342,29 @@ def computeHFProfile(img_row, core, cutoff_ratio=1/8):
 def precomputeNCCHFData(sinogram_image, cores, cutoff_ratio=1/16):
     """
     NCC-HFプロファイル用の事前計算。
-    HPF適用済み画像行のFFT・累積和と、HPF適用済みコアのFFT・統計量を計算する。
+    HPFはL/nc基準で正確に適用し、相互相関用FFTはL_fft=getOptimalDFTSize(L)で実行。
     """
     L = sinogram_image.shape[1]
+    L_fft = cv2.getOptimalDFTSize(L)
     c_L = max(1, int(L * cutoff_ratio))
     hf_mask_L = np.ones(L, dtype=np.float64)
     hf_mask_L[:c_L] = 0
     hf_mask_L[-c_L + 1:] = 0
 
-    # 画像行: HPF → FFT保持, 累積和 (ローカル平均・分散用)
-    img_hf_fft = np.zeros((360, L), dtype=np.complex128)
+    # 画像行: HPF (L基準) → 累積和 → L_fftにゼロパディングしてFFT
+    img_hf_fft = np.zeros((360, L_fft), dtype=np.complex128)
     img_cumsum = np.zeros((360, L + 1), dtype=np.float64)
     img_cumsum_sq = np.zeros((360, L + 1), dtype=np.float64)
     for i in range(360):
-        F = np.fft.fft(sinogram_image[i].astype(np.float64))
-        F *= hf_mask_L
-        img_hf_fft[i] = F
-        row_hf = np.real(np.fft.ifft(F))
+        F_L = np.fft.fft(sinogram_image[i].astype(np.float64))
+        F_L *= hf_mask_L
+        row_hf = np.real(np.fft.ifft(F_L))
         img_cumsum[i, 1:] = np.cumsum(row_hf)
         img_cumsum_sq[i, 1:] = np.cumsum(row_hf ** 2)
+        # L_fft長にゼロパディングして再FFT（相互相関用、高速radix）
+        img_hf_fft[i] = np.fft.fft(row_hf, n=L_fft)
 
-    # コア: HPF (コア長基準) → ゼロパディングしてFFT, 平均・分散
+    # コア: HPF (nc基準) → 平均・分散 → L_fftにゼロパディングしてFFT
     core_hf_fft = [None] * 180
     core_hf_mean = np.zeros(180, dtype=np.float64)
     core_hf_energy = np.zeros(180, dtype=np.float64)  # nc * var
@@ -382,10 +384,8 @@ def precomputeNCCHFData(sinogram_image, cores, cutoff_ratio=1/16):
         core_hf_real = np.real(np.fft.ifft(Fc))
         core_hf_mean[j] = np.mean(core_hf_real)
         core_hf_energy[j] = np.sum((core_hf_real - core_hf_mean[j]) ** 2)
-        # L長にゼロパディングしてFFT（相互相関用）
-        padded = np.zeros(L, dtype=np.float64)
-        padded[:nc] = core_hf_real
-        core_hf_fft[j] = np.fft.fft(padded)
+        # L_fft長にゼロパディングしてFFT（相互相関用）
+        core_hf_fft[j] = np.fft.fft(core_hf_real, n=L_fft)
         valid[j] = True
 
     return {
@@ -398,6 +398,7 @@ def precomputeNCCHFData(sinogram_image, cores, cutoff_ratio=1/16):
         'nc_list': nc_list,
         'valid': valid,
         'L': L,
+        'L_fft': L_fft,
     }
 
 
@@ -617,10 +618,11 @@ def findPositionByNCCHF(sino_img, cores, alpha, n_img, center_t,
     n_rows = len(valid_i)
     nc_arr = ncc_data['nc_list'][valid_j].astype(np.float64)
 
-    # バッチ相互相関: IFFT(img_hf_fft[i] * conj(core_hf_fft[j]))
-    A_mat = ncc_data['img_hf_fft'][valid_i]                        # (n_rows, L)
-    B_mat = np.array([ncc_data['core_hf_fft'][j] for j in valid_j])  # (n_rows, L)
-    cross_spatial = np.real(np.fft.ifft(A_mat * np.conj(B_mat), axis=1))  # (n_rows, L)
+    # バッチ相互相関: IFFT(img_hf_fft[i] * conj(core_hf_fft[j])) を L_fft 長で実行
+    L_fft = ncc_data.get('L_fft', L)  # 後方互換
+    A_mat = ncc_data['img_hf_fft'][valid_i]                          # (n_rows, L_fft)
+    B_mat = np.array([ncc_data['core_hf_fft'][j] for j in valid_j])  # (n_rows, L_fft)
+    cross_spatial = np.real(np.fft.ifft(A_mat * np.conj(B_mat), axis=1))[:, :L]  # (n_rows, L)
 
     # ローカル統計量 (cumsum から window size nc_arr[k] で計算)
     cs = ncc_data['img_cumsum']      # (360, L+1)
@@ -935,22 +937,17 @@ def matchTemplateRotatable(image, template):
     gw = np.exp(-(x**2 + y**2) / (2 * 1.0**2))
     tmpl_windowed = (template.astype(np.float32) * gw).astype(np.uint8)
 
-    # 画像のcorner_pixels_meanでキャンバスを充填（サイノグラム境界外の基準を統一）
-    cm = int((np.mean(image_proc[0, :]) + np.mean(image_proc[-1, :]) +
-              np.mean(image_proc[:, 0]) + np.mean(image_proc[:, -1])) / 4.0)
-    tmpl_canvas = cv2.copyMakeBorder(
-        tmpl_windowed,
-        (img_h - th) // 2, img_h - th - (img_h - th) // 2,
-        (img_w - tw) // 2, img_w - tw - (img_w - tw) // 2,
-        cv2.BORDER_CONSTANT, value=cm)
+    # ネイティブサイズのテンプレートで radon (1px ゼロパッドで corner_mean=0 を保証)
+    tmpl_padded = cv2.copyMakeBorder(
+        tmpl_windowed, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
     t_start = time.time()
     sinogram_image = radonTransformFloat(image_proc)
-    sinogram_template = radonTransformFloat(tmpl_canvas)
+    sinogram_template = radonTransformFloat(tmpl_padded)
     t_radon = time.time() - t_start
     print(f"Radon transform: {t_radon:.3f}s")
 
     cores = extractSinogramCore(sinogram_template, th, tw)
-    n_img = sinogram_template.shape[1]
+    n_img = sinogram_image.shape[1]
 
     # NCC-HF検出（サイノグラム空間のみ、画像空間NCC不要）
     t_detect = time.time()

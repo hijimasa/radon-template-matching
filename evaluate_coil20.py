@@ -105,18 +105,13 @@ def detect_ncchf(image_proc, template):
     gw = np.exp(-(xx**2 + yy**2) / 2.0)
     tmpl_windowed = (template.astype(np.float32) * gw).astype(np.uint8)
 
-    cm = int((np.mean(image_proc[0, :]) + np.mean(image_proc[-1, :]) +
-              np.mean(image_proc[:, 0]) + np.mean(image_proc[:, -1])) / 4.0)
-    tmpl_canvas = cv2.copyMakeBorder(
-        tmpl_windowed,
-        (img_h - th) // 2, img_h - th - (img_h - th) // 2,
-        (img_w - tw) // 2, img_w - tw - (img_w - tw) // 2,
-        cv2.BORDER_CONSTANT, value=cm)
+    tmpl_padded = cv2.copyMakeBorder(
+        tmpl_windowed, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
 
     sino_img = radonTransformFloat(image_proc)
-    sino_tmpl = radonTransformFloat(tmpl_canvas)
+    sino_tmpl = radonTransformFloat(tmpl_padded)
     cores = extractSinogramCore(sino_tmpl, th, tw)
-    n_img = sino_tmpl.shape[1]
+    n_img = sino_img.shape[1]
 
     ncc_angle, _, _, _ = detectByNCCHF(
         sino_img, cores, n_img, th, tw, img_h, img_w, verbose=False)
