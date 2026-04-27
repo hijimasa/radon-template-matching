@@ -23,14 +23,21 @@ Rotation-invariant template matching via NCC-HF (Normalized Cross-Correlation in
    適応的コントラスト正規化
 
 2. Radon transform -> float32 sinogram (360 angles)
-   ラドン変換 -> float32サイノグラム (画像・テンプレートキャンバス各1回)
+   ラドン変換 -> float32サイノグラム
+   - Image: native size
+   - Template: native size + 1px zero pad (corner_mean=0 を保証)
+     画像サイズへのキャンバス展開は不要 (テンプレートのline_lengthが
+     小さくなるため、Radonコスト O(line_length²·360) が大幅に減る)
 
 3. Precompute NCC-HF data
    事前計算: HPF適用済みFFT・累積和・コア統計量
+   - HPF は L (画像サイノグラム長) / nc (コア長) 基準で正確に適用
+   - 相互相関用FFTは L_fft = cv2.getOptimalDFTSize(L) にゼロパディング
+     (radix-{2,3,5} 分解可能な長さで OpenCV/numpy のFFTを高速化)
 
 4. For each candidate angle alpha:
    各候補角度 alpha に対して:
-   a. Batch cross-correlation via IFFT  (バッチ相互相関)
+   a. Batch cross-correlation via IFFT (length L_fft)  (バッチ相互相関)
    b. Local NCC profile from running stats (ローカルNCC算出)
    c. Hierarchical position search (step=4 -> 2 -> 1)
       階層的位置探索 (正弦波パスに沿ったNCC平均の最大化)
@@ -150,9 +157,15 @@ NCC-HFのHPFカットオフは `cutoff_ratio=1/16` (DCおよび最低6%の超低
 - カットオフが高すぎる (1/8以上): 黒背景で判別力が不足し、0度付近で大外れが発生
 - カットオフが低すぎる (1/32以下): 背景の低周波成分が残り、自然画像での判別力が低下する可能性
 
-### テンプレートキャンバスの充填値
+### テンプレートのRadon変換: ネイティブサイズ + 1pxゼロパッド
 
-テンプレートをサイノグラム変換する際、キャンバスの背景は画像の `corner_pixels_mean` (辺縁画素平均) で充填する。これにより画像とテンプレートのサイノグラム境界外基準が統一され、残差にベースライン差が生じない。
+テンプレートを画像サイズのキャンバスにゼロパディングしてからRadon変換する旧方式は、`line_length²·360` のコストを画像のline_lengthで支払うため重い。テンプレートのネイティブサイズで直接Radonすれば line_length が小さくなり、`extractSinogramCore` はテンプレートの `(th, tw)` 基準でコア幅を決めるため切り出される内容は同一になる。
+
+ただし `applyGaussianWindow` 適用後でも境界画素値はゼロにならない(σ=1.0で約 exp(-1)≈0.37 倍の値が残る)。`radonTransformFloat` は画像外サンプル時にこの非ゼロ `corner_mean` を加算するため、ロー方向に「ラインの何%が画像外か」に応じた非一様なベースラインが乗りHPFでも除去しきれない。これを避けるためテンプレートに**1pxゼロパッド**を付与し、`corner_mean=0` を保証する。
+
+### FFT長最適化 (L_fft)
+
+NCC-HFのFFT/IFFT長は本来 `L = sinogram_image.cols` で十分だが、典型的なサイズは `L = sqrt(h²+w²)` 由来でOpenCV/numpyのFFT非radixパスにハマりやすい (例: L=362=2×181の素数因数, L=840=因数7あり)。HPFは精度のためL基準で正確に適用しつつ、相互相関のFFT/IFFTのみ `L_fft = cv2.getOptimalDFTSize(L)` (radix-{2,3,5} 分解可能な最小長) にゼロパディングして実行することで、自然画像サイズではC++で約2.6倍の高速化が得られる。`cumsum` ベースの局所統計量はゼロパディング部分が混入するためL基準のままにする。
 
 ## References / 参照
 
